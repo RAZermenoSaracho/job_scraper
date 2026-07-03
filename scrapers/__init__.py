@@ -1,0 +1,1 @@
+from scrapers.fw3_jobscraper import Fw3Scraper

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments (por si en algún momento usas venv además de conda)
+venv/
+env/
+.venv/
+
+# Conda (opcional, por si generas un environment.yml o similar localmente)
+# No es necesario ignorar el entorno conda en sí, ya que vive fuera del repo
+
+# Distribución / empaquetado
+build/
+dist/
+*.egg-info/
+
+# Resultados generados por el scraper (no deberían versionarse, se regeneran en cada corrida)
+*_results_*.json
+
+# Selenium / ChromeDriver (por si algo queda cacheado localmente)
+.wdm/
+
+# Logs
+*.log
+
+# Archivos de entorno con secretos (por si en el futuro agregas API keys, etc.)
+.env
+.env.local
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
