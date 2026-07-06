@@ -11,8 +11,14 @@ import json
 import logging
 from datetime import date
 from pathlib import Path
+import pandas as pd
+import os
+from dotenv import load_dotenv
 
+from filters import filter_jobs
 from scrapers import Fw3Scraper
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,8 +29,21 @@ logging.basicConfig(
 ROOT_DIR = Path(__file__).resolve().parent
 KEYWORDS_FILE = ROOT_DIR / "keywords.json"
 
-MAX_JOBS_SEARCHED_PER_KEYWORD = 10
-MAX_JOBS_SAVED = 5
+MAX_JOBS_SEARCHED_PER_KEYWORD = int(os.environ.get("MAX_JOBS_SEARCHED_PER_KEYWORD", 20))
+MAX_JOBS_SAVED = int(os.environ.get("MAX_JOBS_SAVED", 10))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", ROOT_DIR))
+MAX_EXPERIENCE_YEARS = int(os.environ.get("MAX_EXPERIENCE_YEARS", 4))
+
+OUTPUT_COLUMNS = [
+    "Job Title",
+    "Company Name",
+    "Job Description",
+    "Job Location",
+    "Compensation",
+    "Job Url",
+    "Tags",
+    "Notes",
+]
 
 # Each entry is (display_name, scraper_instance).
 # Scrapers run in order; their results are concatenated into one output file.
@@ -39,14 +58,15 @@ def _output_path() -> Path:
     today = date.today().strftime("%Y_%m_%d")
     n = 1
     while True:
-        path = ROOT_DIR / f"{today}_results_{n:03d}.json"
+        path = OUTPUT_DIR / f"{today}_results_{n:03d}.json"
         if not path.exists():
             return path
         n += 1
 
 
 def main() -> None:
-    keywords = json.loads(KEYWORDS_FILE.read_text())
+    config = json.loads(KEYWORDS_FILE.read_text())
+    keywords = config["keywords"]
     print(f"Keywords loaded: {len(keywords)}")
 
     all_jobs: list = []
@@ -57,13 +77,23 @@ def main() -> None:
         print(f"  Jobs returned : {len(jobs)}")
         all_jobs.extend(jobs)
 
+    all_jobs, dropped = filter_jobs(all_jobs, config, MAX_EXPERIENCE_YEARS)
+    print(f"\nDescartados por ubicación: {dropped['location']}")
+    print(f"Descartados por anti-keywords: {dropped['anti_keywords']}")
+    print(f"Descartados por experiencia: {dropped['experience']}")
+
     out_path = _output_path()
     out_path.write_text(
         json.dumps({"keywords": keywords, "jobs": all_jobs}, indent=2, ensure_ascii=False)
     )
 
+    xlsx_path = out_path.with_suffix(".xlsx")
+    df = pd.DataFrame(all_jobs, columns=OUTPUT_COLUMNS)
+    df.to_excel(xlsx_path, index=False)
+
     print(f"\n  Jobs saved    : {len(all_jobs)}")
     print(f"  Output file   : {out_path.name}")
+    print(f"  Excel file    : {xlsx_path.name}")
     print("\nDone.")
 
 

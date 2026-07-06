@@ -26,6 +26,12 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 log = logging.getLogger(__name__)
 
+# Matches a compensation value or range, e.g. "$125K – $273K", "€85,176K", "£90K-£120K".
+# Currency symbol may appear once (start only) or on both sides of the range.
+COMPENSATION_PATTERN = re.compile(
+    r"[€$£¥]\s?\d+(?:[.,]\d+)?K(?:\s*[-–—]\s*[€$£¥]?\s?\d+(?:[.,]\d+)?K)?"
+)
+
 
 class Fw3Scraper:
     """Scraper for findweb3.com job listings."""
@@ -41,8 +47,9 @@ class Fw3Scraper:
         Full pipeline: scrape all keyword pages → deduplicate → fetch details
         → score → sort → top-N.
 
-        Accepts keywords as input; returns a clean list of job dicts (no _ fields).
-        Does not read or write any files.
+        Accepts keywords as input; returns a clean list of job dicts matching the
+        output schema (Job Title, Company Name, Job Description, Job Location,
+        Compensation, Job Url, Tags, Notes). Does not read or write any files.
         """
         driver = self._build_driver()
         ordered_urls: dict = {}  # dict used as an ordered set
@@ -55,7 +62,8 @@ class Fw3Scraper:
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
             raw_jobs = []
 
-            for url in ordered_urls:
+            for n, url in enumerate(ordered_urls, start=1):
+                log.info(f"Scrapped: {n} / {len(ordered_urls)}")
                 detail = self.extract_job_detail(driver, url)
                 if detail:
                     raw_jobs.append(detail)
@@ -65,12 +73,21 @@ class Fw3Scraper:
             driver.quit()
 
         for job in raw_jobs:
-            job["_score"] = self.compute_match_score(job.get("_page_text", ""), keywords)
+            job["_tags"] = self.match_keywords(job.get("_page_text", ""), keywords)
 
-        raw_jobs.sort(key=lambda j: j["_score"], reverse=True)
+        raw_jobs.sort(key=lambda j: len(j["_tags"]), reverse=True)
 
         return [
-            {k: v for k, v in job.items() if not k.startswith("_")}
+            {
+                "Job Title": job["name"],
+                "Company Name": job["company_name"],
+                "Job Description": job["description_html"],
+                "Job Location": job["location"],
+                "Compensation": job["compensation"],
+                "Job Url": job["url"],
+                "Tags": ", ".join(job["_tags"]),
+                "Notes": "",
+            }
             for job in raw_jobs[: self.top_n_results]
         ]
 
@@ -134,46 +151,30 @@ class Fw3Scraper:
         except NoSuchElementException:
             page_text = name
 
-        location = self._find_field(driver, [
-            "//*[contains(@class,'location')]",
-            "//*[contains(@data-testid,'location')]",
-            "//span[contains(text(),'Remote') or contains(text(),'remote')]",
-            "//li[contains(text(),'Remote') or contains(text(),'Location')]",
-        ])
+        company_name = self._wait_and_get_text(driver, "h2.JobPage_companyName__G6Nta")
+        location = self._wait_and_get_text(driver, "div.JobPage_companyLocation__jz0CV")
+        compensation = self._find_compensation(driver)
 
-        job_type = self._find_field(driver, [
-            "//*[contains(@class,'type') or contains(@class,'job-type')]",
-            "//*[contains(@data-testid,'type')]",
-            "//span[contains(text(),'Full Time') or contains(text(),'Part Time') "
-            "     or contains(text(),'Contract') or contains(text(),'Internship')]",
-            "//li[contains(text(),'Full Time') or contains(text(),'Part Time') "
-            "    or contains(text(),'Contract') or contains(text(),'Internship')]",
+        description_html = self._find_html_field(driver, [
+            "//*[contains(translate(@class,'DESCRIPTION','description'),'description')]",
+            "//*[contains(translate(@data-testid,'DESCRIPTION','description'),'description')]",
         ])
-
-        compensation = self._find_field(driver, [
-            "//*[contains(@class,'salary') or contains(@class,'compensation')]",
-            "//*[contains(@data-testid,'salary') or contains(@data-testid,'compensation')]",
-            "//span[contains(text(),'$') or contains(text(),'USD') or contains(text(),'salary')]",
-            "//li[contains(text(),'$') or contains(text(),'USD')]",
-        ])
-
-        application_url = self._find_apply_url(driver, job_url)
 
         return {
             "name": name,
             "url": job_url,
             "location": location,
-            "type": job_type,
+            "company_name": company_name,
             "compensation": compensation,
-            "application_url": application_url,
+            "description_html": description_html,
             "_page_text": page_text,
         }
 
     @staticmethod
-    def compute_match_score(job_text: str, keywords: list) -> int:
-        """Count unique keywords present in job_text (case-insensitive, presence only)."""
+    def match_keywords(job_text: str, keywords: list) -> list:
+        """Return the subset of keywords (original casing) present in job_text (case-insensitive)."""
         text = job_text.lower()
-        return sum(1 for kw in keywords if kw.lower() in text)
+        return [kw for kw in keywords if kw.lower() in text]
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
@@ -192,43 +193,35 @@ class Fw3Scraper:
         service = Service(ChromeDriverManager().install())
         return webdriver.Chrome(service=service, options=opts)
 
-    def _find_field(self, driver: webdriver.Chrome, xpaths: list) -> str | None:
-        """Try each XPath; return the first non-empty text match, or None."""
+    def _wait_and_get_text(self, driver: webdriver.Chrome, css_selector: str, timeout: int = 5) -> str | None:
+        """Wait for a CSS selector to render, then return its stripped text, or None."""
+        try:
+            el = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, css_selector))
+            )
+            text = el.text.strip()
+            return text or None
+        except (TimeoutException, NoSuchElementException):
+            return None
+
+    def _find_compensation(self, driver: webdriver.Chrome) -> str | None:
+        """
+        Return the first compensation match found across all div.JobPage_keyDetail__Dddhf
+        elements, or None if none contain a recognizable compensation value/range.
+        """
+        for el in driver.find_elements(By.CSS_SELECTOR, "div.JobPage_keyDetail__Dddhf"):
+            match = COMPENSATION_PATTERN.search(el.text)
+            if match:
+                return match.group(0)
+        return None
+
+    def _find_html_field(self, driver: webdriver.Chrome, xpaths: list) -> str | None:
+        """Try each XPath; return the first match's raw innerHTML (unsanitized), or None."""
         for xpath in xpaths:
             try:
-                text = driver.find_element(By.XPATH, xpath).text.strip()
-                if text:
-                    return text
+                html = driver.find_element(By.XPATH, xpath).get_attribute("innerHTML")
+                if html and html.strip():
+                    return html
             except NoSuchElementException:
                 continue
         return None
-
-    def _find_apply_url(self, driver: webdriver.Chrome, fallback: str) -> str:
-        """
-        Return the external application URL from the Apply button/link.
-        Primary: div.JobPage_jobApplyCard__tFzYs a.mediumButton (findweb3-specific).
-        Fallback: any external <a> not pointing to findweb3.com.
-        """
-        try:
-            el = driver.find_element(
-                By.CSS_SELECTOR, "div.JobPage_jobApplyCard__tFzYs a.mediumButton"
-            )
-            href = el.get_attribute("href") or ""
-            if href:
-                return href
-        except NoSuchElementException:
-            pass
-
-        for xpath in [
-            "//a[contains(translate(normalize-space(text()),'APPLY','apply'),'apply') "
-            "    and contains(@href,'http') and not(contains(@href,'findweb3'))]",
-            "//a[contains(@href,'http') and not(contains(@href,'findweb3.com'))]",
-        ]:
-            try:
-                href = driver.find_element(By.XPATH, xpath).get_attribute("href") or ""
-                if href:
-                    return href
-            except NoSuchElementException:
-                continue
-
-        return fallback
