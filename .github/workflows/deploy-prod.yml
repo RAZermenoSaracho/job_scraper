@@ -1,0 +1,15 @@
+name: Deploy Production
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Deploy Job Scraper
+        run: |
+          ~/scripts/deploy-job-scraper-prod.sh

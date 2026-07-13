@@ -24,6 +24,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+from utils.filters import job_text, passes_anti_keywords, passes_experience, passes_location
+
 log = logging.getLogger(__name__)
 
 # Matches a compensation value or range, e.g. "$125K – $273K", "€85,176K", "£90K-£120K".
@@ -36,16 +38,29 @@ COMPENSATION_PATTERN = re.compile(
 class Fw3Scraper:
     """Scraper for findweb3.com job listings."""
 
-    def __init__(self, max_jobs_per_keyword: int = 20, top_n_results: int = 10) -> None:
+    def __init__(
+        self,
+        max_jobs_per_keyword: int = 20,
+        top_n_results: int = 10,
+        acceptable_locations: list | None = None,
+        anti_keywords: list | None = None,
+        max_experience_years: int | None = None,
+    ) -> None:
         self.max_jobs_per_keyword = max_jobs_per_keyword
         self.top_n_results = top_n_results
+        self.acceptable_locations = acceptable_locations or []
+        self.anti_keywords = anti_keywords or []
+        self.max_experience_years = max_experience_years
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def run(self, keywords: list) -> list:
         """
-        Full pipeline: scrape all keyword pages → deduplicate → fetch details
-        → score → sort → top-N.
+        Full pipeline: scrape all keyword pages → deduplicate → visit every candidate,
+        filtering each one inline as soon as its fields are extracted. Every candidate
+        that survives all filters is scored by keyword-match count; once all candidates
+        have been visited, the surviving pool is ranked by score and the top_n_results
+        best are returned — not just the first ones found to pass.
 
         Accepts keywords as input; returns a clean list of job dicts matching the
         output schema (Job Title, Company Name, Job Description, Job Location,
@@ -54,42 +69,70 @@ class Fw3Scraper:
         driver = self._build_driver()
         ordered_urls: dict = {}  # dict used as an ordered set
 
+        candidates: list = []  # (score, job) for every candidate that passed all filters
+        drop_counts = {"location": 0, "anti_keywords": 0, "experience": 0}
+
         try:
             for kw in keywords:
                 for url in self.search_by_keyword(driver, kw):
                     ordered_urls[url] = None
 
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
-            raw_jobs = []
 
             for n, url in enumerate(ordered_urls, start=1):
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
-                detail = self.extract_job_detail(driver, url)
-                if detail:
-                    raw_jobs.append(detail)
+                raw = self.extract_job_detail(driver, url)
                 time.sleep(random.uniform(1, 2))
+                if not raw:
+                    continue
+
+                job = {
+                    "Job Title": raw["name"],
+                    "Company Name": raw["company_name"],
+                    "Job Description": raw["description_html"],
+                    "Job Location": raw["location"],
+                    "Compensation": raw["compensation"],
+                    "Job Url": raw["url"],
+                }
+
+                if not passes_location(job, self.acceptable_locations):
+                    drop_counts["location"] += 1
+                    continue
+                if not passes_anti_keywords(job, self.anti_keywords):
+                    drop_counts["anti_keywords"] += 1
+                    continue
+                if not passes_experience(job, self.max_experience_years):
+                    drop_counts["experience"] += 1
+                    continue
+
+                tags = self.match_keywords(job_text(job), keywords)
+                job["Tags"] = ", ".join(tags)
+                job["Notes"] = ""
+
+                candidates.append((len(tags), job))
 
         finally:
             driver.quit()
 
-        for job in raw_jobs:
-            job["_tags"] = self.match_keywords(job.get("_page_text", ""), keywords)
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        selected = candidates[: self.top_n_results]
 
-        raw_jobs.sort(key=lambda j: len(j["_tags"]), reverse=True)
+        log.info(
+            "Filtered %d candidate(s): %d passed (dropped — location: %d, anti_keywords: %d, experience: %d)",
+            len(ordered_urls),
+            len(candidates),
+            drop_counts["location"],
+            drop_counts["anti_keywords"],
+            drop_counts["experience"],
+        )
+        if selected:
+            scores = [score for score, _ in selected]
+            log.info(
+                "Selected top %d of %d passing candidate(s) — score min: %d, max: %d",
+                len(selected), len(candidates), min(scores), max(scores),
+            )
 
-        return [
-            {
-                "Job Title": job["name"],
-                "Company Name": job["company_name"],
-                "Job Description": job["description_html"],
-                "Job Location": job["location"],
-                "Compensation": job["compensation"],
-                "Job Url": job["url"],
-                "Tags": ", ".join(job["_tags"]),
-                "Notes": "",
-            }
-            for job in raw_jobs[: self.top_n_results]
-        ]
+        return [job for _, job in selected]
 
     def search_by_keyword(self, driver: webdriver.Chrome, keyword: str) -> list:
         """
@@ -146,11 +189,6 @@ class Fw3Scraper:
             log.warning("Skipping %s — no <h1> found", job_url)
             return None
 
-        try:
-            page_text = driver.find_element(By.TAG_NAME, "body").text
-        except NoSuchElementException:
-            page_text = name
-
         company_name = self._wait_and_get_text(driver, "h2.JobPage_companyName__G6Nta")
         location = self._wait_and_get_text(driver, "div.JobPage_companyLocation__jz0CV")
         compensation = self._find_compensation(driver)
@@ -167,14 +205,13 @@ class Fw3Scraper:
             "company_name": company_name,
             "compensation": compensation,
             "description_html": description_html,
-            "_page_text": page_text,
         }
 
     @staticmethod
-    def match_keywords(job_text: str, keywords: list) -> list:
-        """Return the subset of keywords (original casing) present in job_text (case-insensitive)."""
-        text = job_text.lower()
-        return [kw for kw in keywords if kw.lower() in text]
+    def match_keywords(text: str, keywords: list) -> list:
+        """Return the subset of keywords (original casing) present in text (case-insensitive)."""
+        lowered = text.lower()
+        return [kw for kw in keywords if kw.lower() in lowered]
 
     # ── Private helpers ────────────────────────────────────────────────────────
 

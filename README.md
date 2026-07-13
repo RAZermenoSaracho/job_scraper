@@ -1,21 +1,24 @@
 # job_scraper
 
-Scrapes job boards for postings matching a set of keywords, ranks each posting by how many
-*unique* keywords it mentions, and saves the top-N results per site to JSON and XLSX files.
-Currently supports [findweb3.com](https://findweb3.com), built so additional sources can be
-added as independent scraper modules without touching the orchestration logic.
+A FastAPI service that scrapes job boards for postings matching a set of keywords, ranks each
+posting by how many *unique* keywords it mentions, and returns the top-N results as a JSON HTTP
+response. Currently supports [findweb3.com](https://findweb3.com), built so additional sources can
+be added as independent scraper modules without touching the request-handling logic. No files are
+written to disk — every run happens on-demand via an HTTP request.
 
 ## Project structure
 
 ```
 .
 ├── keywords.json              # Search/scoring keywords + filter config (locations, anti-keywords)
-├── main.py                    # Entry point: reads keywords.json, runs scrapers, filters, writes output JSON + XLSX
-├── filters.py                 # Post-scrape filtering: location, anti-keywords, required experience
+├── app.py                     # FastAPI app: GET /jobs reads env vars + keywords.json, runs scrapers, returns JSON
 ├── requirements.txt           # Pinned dependencies for the `job_scraper` conda env
+├── utils/
+│   ├── __init__.py            # Exposes the filter predicates for import as `from utils import ...`
+│   └── filters.py             # Per-job filter predicates: location, anti-keywords, required experience
 └── scrapers/
     ├── __init__.py            # Exposes Fw3Scraper for import as `from scrapers import Fw3Scraper`
-    └── fw3_jobscraper.py       # Fw3Scraper: headless-Selenium scraper for findweb3.com
+    └── fw3_jobscraper.py       # Fw3Scraper: headless-Selenium scraper for findweb3.com; filters + ranks candidates internally
 ```
 
 ## Prerequisites
@@ -48,93 +51,86 @@ A JSON object with three keys:
 
 - `keywords` drives two things:
   1. **Search** — every scraper queries the target site once per keyword.
-  2. **Scoring & tagging** — for each posting, the keywords found anywhere in its text
-     (case-insensitive substring match) become that job's `Tags`. Postings are ranked by
-     *unique* keyword match count, not frequency.
-- `acceptable_locations` and `anti_keywords` feed the post-scrape filters — see
-  [Filtering](#filtering) below. Leave either as `[]` to disable that filter.
+  2. **Scoring & tagging** — a posting's score is the count of *unique* keywords found in its
+     `Job Title` + plain-text `Job Description` (case-insensitive substring match). Matched
+     keywords are recorded as that job's `Tags`.
+- `acceptable_locations` and `anti_keywords` feed the filters — see [Filtering](#filtering) below.
+  Leave either as `[]` to disable that filter.
 
-### Per-scraper parameters
+`app.py` reads this file fresh on every request — edits take effect on the next call, no restart
+needed.
 
-Scrapers are instantiated in the `SCRAPERS` list in [main.py](main.py):
+### Request parameters
 
-```python
-MAX_JOBS_SEARCHED_PER_KEYWORD = 10
-MAX_JOBS_SAVED = 5
+`GET /jobs` accepts three optional query params, each falling back to an env var if omitted:
 
-SCRAPERS = [
-    ("findweb3.com", Fw3Scraper(max_jobs_per_keyword=MAX_JOBS_SEARCHED_PER_KEYWORD, top_n_results=MAX_JOBS_SAVED)),
-]
+| Query param | Env var fallback (default) | Meaning |
+|---|---|---|
+| `max_jobs_searched_per_keyword` | `MAX_JOBS_SEARCHED_PER_KEYWORD` (20) | Candidate postings explored per keyword search |
+| `max_jobs_saved` | `MAX_JOBS_SAVED` (10) | How many top-ranked postings to return |
+| `max_experience_years` | `MAX_EXPERIENCE_YEARS` (4) | See [Filtering](#filtering) below |
+
+Env var defaults are read from a git-ignored `.env` file (via `python-dotenv`) at process startup.
+
+## Filtering
+
+Filtering happens **inside each scraper**, inline while it visits candidates — not in `app.py`
+after the fact. As `Fw3Scraper` visits each candidate job URL, it extracts the job's fields, maps
+them to the output schema, and immediately runs the result through three filter predicates from
+[utils/filters.py](utils/filters.py):
+
+1. **`passes_location`** — passes if `Job Location` is empty/unknown, or contains (case-insensitive
+   substring) any entry from `acceptable_locations`; fails otherwise. No-op if `acceptable_locations`
+   is `[]`.
+2. **`passes_anti_keywords`** — fails if `Job Title` + plain-text `Job Description` (HTML stripped,
+   for matching only — the stored field stays raw HTML) contains any `anti_keywords` entry. No-op
+   if the list is `[]`.
+3. **`passes_experience`** — scans the same title + description text for "years of experience"
+   mentions (`"N+ years"`, `"N-M years"`, plain `"N years"` — which also covers `"at least N years"`
+   / `"minimum of N years"`). For a range, only the **minimum** is compared: a job asking for
+   `"3-7 years"` passes if `max_experience_years` is `4`, since you clear the 3-year floor. Fails
+   only if some mention's minimum exceeds `max_experience_years`; jobs with no experience mention
+   pass.
+
+A candidate that fails any filter is dropped immediately and the scraper moves on to the next
+candidate URL.
+
+### Ranking (evaluate all, then pick the best N)
+
+The scraper does **not** stop as soon as it has `max_jobs_saved` passing candidates. It visits
+*every* candidate found during search (up to `max_jobs_searched_per_keyword` per keyword), and each
+one that survives the three filters gets a relevance score — the count of unique `keywords` matched
+in its title + description. Only after all candidates have been visited does it sort the surviving
+pool by score (descending) and return the best `max_jobs_saved`. This matters because stopping
+early at the first N passing candidates would return "first found," not "most relevant" — a
+higher-scoring candidate found later wouldn't get a chance to bump out a weaker, earlier one.
+
+Each scraper logs drop counts per filter, plus the score range of its final selection, e.g.:
+
 ```
-
-- `max_jobs_per_keyword` — max postings explored per keyword search (limits scraping volume/time).
-- `top_n_results` — how many top-scoring postings that scraper keeps in its final output.
-
-To change these, edit the constants or the constructor arguments directly in `main.py`.
-
-### Filtering
-
-After all scrapers run, `main.py` calls `filter_jobs()` from [filters.py](filters.py) to drop
-jobs before writing any output. Three filters run in sequence:
-
-1. **Location** — keeps a job if `Job Location` is empty/unknown, or contains (case-insensitive
-   substring) any entry from `acceptable_locations`; drops it otherwise. Disabled (no-op) if
-   `acceptable_locations` is `[]`.
-2. **Anti-keywords** — drops a job if `Job Title` or `Job Description` (HTML stripped, for
-   matching only — the stored field stays raw HTML) contains any `anti_keywords` entry.
-   Disabled if the list is `[]`.
-3. **Experience** — reads `MAX_EXPERIENCE_YEARS` from `.env` (default `4`) and scans the title +
-   description for "years of experience" mentions (`"N+ years"`, `"N-M years"`, plain
-   `"N years"` — which also covers `"at least N years"` / `"minimum of N years"`). For a range,
-   only the **minimum** is compared: a job asking for `"3-7 years"` is kept if your max is `4`,
-   since you clear the 3-year floor. A job is dropped only if some mention's minimum exceeds
-   `MAX_EXPERIENCE_YEARS`; jobs with no experience mention are kept.
-
-Console output reports how many jobs each filter dropped, e.g.:
-
-```
-Descartados por ubicación: 3
-Descartados por anti-keywords: 1
-Descartados por experiencia: 2
+13:32:50 [INFO] Filtered 40 candidate(s): 12 passed (dropped — location: 20, anti_keywords: 3, experience: 5)
+13:32:50 [INFO] Selected top 5 of 12 passing candidate(s) — score min: 3, max: 8
 ```
 
 ## Usage
 
+Run the API locally:
+
 ```bash
 conda activate job_scraper
-python main.py
+uvicorn app:app --reload
 ```
 
-Expected console output:
+Call it:
 
-```
-Keywords loaded: 10
-
-── findweb3.com ──────────────────────────────
-  Jobs returned : 8
-
-Descartados por ubicación: 2
-Descartados por anti-keywords: 0
-Descartados por experiencia: 1
-
-  Jobs saved    : 5
-  Output file   : 2026_07_06_results_001.json
-  Excel file    : 2026_07_06_results_001.xlsx
-
-Done.
+```bash
+curl "http://127.0.0.1:8000/jobs?max_jobs_searched_per_keyword=10&max_jobs_saved=5&max_experience_years=4"
 ```
 
-## Output format
+Interactive API docs (Swagger UI) are available at `http://127.0.0.1:8000/docs` once the server is
+running.
 
-Each run writes two files sharing the same base name,
-`{YYYY}_{MM}_{DD}_results_{NNN}.{json,xlsx}`, where `NNN` is a sequential counter starting at
-`001` and incrementing for each run on the same day (existing files are never overwritten).
-
-- `.json` — `{"keywords": [...], "jobs": [...]}`, the full run output.
-- `.xlsx` — the same job rows as a single-sheet spreadsheet, one row per job, columns matching
-  the schema below (no `keywords` wrapper).
-
-JSON example:
+## Response format
 
 ```json
 {
@@ -154,12 +150,17 @@ JSON example:
 }
 ```
 
-`jobs` is the concatenation of every scraper's results, each already cut down to its own
-`top_n_results` and then run through the filters described above. Field notes:
-- `Job Description` is raw HTML as extracted from the page — not sanitized or converted to plain text (stored as-is in both the JSON and the XLSX cell).
+`jobs` is the concatenation of every scraper's results, each already filtered and ranked down to
+its own `max_jobs_saved` (see [Filtering](#filtering) above). Field notes:
+- `Job Description` is raw HTML as extracted from the page — not sanitized or converted to plain text.
 - `Tags` is a comma-separated string of the keywords (from `keywords.json`) that matched this specific posting.
-- `Notes` is always `""` — reserved for manual fill-in after scraping.
+- `Notes` is always `""` — reserved for manual fill-in downstream.
 - `Company Name`, `Job Location`, and `Compensation` are `null`/empty when the scraper couldn't find a matching element on the page.
+
+### Errors
+
+- `keywords.json` missing or invalid → `500` with `{"detail": "Failed to read keywords.json: ..."}`.
+- A scraper raises an exception mid-run → `502` with `{"detail": "Scraper '<name>' failed: ..."}`.
 
 ## Adding a new scraper
 
@@ -174,17 +175,23 @@ JSON example:
    ```
 
 2. Export it from `scrapers/__init__.py`.
-3. Import and add it to the `SCRAPERS` list in `main.py`:
+3. Import and add it to the list returned by `_build_scrapers()` in `app.py`:
 
    ```python
-   SCRAPERS = [
-       ("findweb3.com", Fw3Scraper(max_jobs_per_keyword=10, top_n_results=5)),
-       ("otta.com", OttaScraper(max_jobs_per_keyword=20, top_n_results=10)),
-   ]
+   def _build_scrapers(config, max_jobs_searched_per_keyword, max_jobs_saved, max_experience_years):
+       return [
+           ("findweb3.com", Fw3Scraper(max_jobs_per_keyword=max_jobs_searched_per_keyword, top_n_results=max_jobs_saved, ...)),
+           ("otta.com", OttaScraper(max_jobs_per_keyword=20, top_n_results=10)),
+       ]
    ```
 
-No changes to the orchestration loop in `main.py` are needed — it just iterates `SCRAPERS` and
-concatenates results.
+If the new scraper should support the same location/anti-keyword/experience filtering and
+best-of-N ranking, accept `acceptable_locations`, `anti_keywords`, and `max_experience_years` in its
+`__init__`, apply the predicates from `utils/filters.py` inline in its own search loop, and rank all
+surviving candidates by score before cutting to `top_n_results` — the same way `Fw3Scraper` does.
+
+No changes to `get_jobs()`'s orchestration loop in `app.py` are needed — it just iterates
+`_build_scrapers(...)` and concatenates results.
 
 ## Notes / known limitations
 
@@ -194,4 +201,7 @@ concatenates results.
 - `robots.txt` is respected and randomized delays (1–2.5s) are added between page loads to avoid
   hammering the site.
 - `Job Url` points to the findweb3.com listing page, not an external application link — this
-  scraper no longer follows the "Apply" button.
+  scraper does not follow the "Apply" button.
+- Each request runs Selenium synchronously in the request handler — a single `GET /jobs` call can
+  take a while (one page load per keyword, plus one per surviving/candidate job detail page). There
+  is no background job queue; the HTTP response only returns once scraping finishes.
