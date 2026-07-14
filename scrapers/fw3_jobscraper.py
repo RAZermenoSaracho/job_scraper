@@ -24,7 +24,13 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-from utils.filters import job_text, passes_anti_keywords, passes_experience, passes_location
+from utils.filters import (
+    job_text,
+    passes_anti_keywords,
+    passes_discarded_urls,
+    passes_experience,
+    passes_location,
+)
 
 log = logging.getLogger(__name__)
 
@@ -44,23 +50,27 @@ class Fw3Scraper:
         top_n_results: int = 10,
         acceptable_locations: list | None = None,
         anti_keywords: list | None = None,
+        discarded_urls: list | None = None,
         max_experience_years: int | None = None,
     ) -> None:
         self.max_jobs_per_keyword = max_jobs_per_keyword
         self.top_n_results = top_n_results
         self.acceptable_locations = acceptable_locations or []
         self.anti_keywords = anti_keywords or []
+        self.discarded_urls = set(discarded_urls or [])
         self.max_experience_years = max_experience_years
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def run(self, keywords: list) -> list:
         """
-        Full pipeline: scrape all keyword pages → deduplicate → visit every candidate,
-        filtering each one inline as soon as its fields are extracted. Every candidate
-        that survives all filters is scored by keyword-match count; once all candidates
-        have been visited, the surviving pool is ranked by score and the top_n_results
-        best are returned — not just the first ones found to pass.
+        Full pipeline: scrape all keyword pages → deduplicate → visit every candidate not
+        already in discarded_urls (checked before any page load, to skip known-unwanted
+        URLs without spending an HTTP request on them), filtering each one inline as soon
+        as its fields are extracted. Every candidate that survives all filters is scored
+        by keyword-match count; once all candidates have been visited, the surviving pool
+        is ranked by score and the top_n_results best are returned — not just the first
+        ones found to pass.
 
         Accepts keywords as input; returns a clean list of job dicts matching the
         output schema (Job Title, Company Name, Job Description, Job Location,
@@ -70,7 +80,7 @@ class Fw3Scraper:
         ordered_urls: dict = {}  # dict used as an ordered set
 
         candidates: list = []  # (score, job) for every candidate that passed all filters
-        drop_counts = {"location": 0, "anti_keywords": 0, "experience": 0}
+        drop_counts = {"discarded_urls": 0, "location": 0, "anti_keywords": 0, "experience": 0}
 
         try:
             for kw in keywords:
@@ -80,6 +90,10 @@ class Fw3Scraper:
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
 
             for n, url in enumerate(ordered_urls, start=1):
+                if not passes_discarded_urls(url, self.discarded_urls):
+                    drop_counts["discarded_urls"] += 1
+                    continue
+
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
                 raw = self.extract_job_detail(driver, url)
                 time.sleep(random.uniform(1, 2))
@@ -118,9 +132,11 @@ class Fw3Scraper:
         selected = candidates[: self.top_n_results]
 
         log.info(
-            "Filtered %d candidate(s): %d passed (dropped — location: %d, anti_keywords: %d, experience: %d)",
+            "Filtered %d candidate(s): %d passed "
+            "(dropped — discarded_urls: %d, location: %d, anti_keywords: %d, experience: %d)",
             len(ordered_urls),
             len(candidates),
+            drop_counts["discarded_urls"],
             drop_counts["location"],
             drop_counts["anti_keywords"],
             drop_counts["experience"],

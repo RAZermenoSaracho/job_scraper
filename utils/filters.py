@@ -1,8 +1,11 @@
 """
-Per-job filter predicates. Scrapers call these inline, right after extracting a
-candidate's fields, so a discarded job never displaces a still-unseen candidate
-that would have passed — the scraper keeps visiting candidates until it has
-top_n_results accepted jobs or runs out of candidates to check.
+Per-candidate filter predicates used by scrapers during their search loop.
+
+`passes_discarded_urls` operates on the raw candidate URL and should be checked before
+any HTTP request is made to fetch job details — it's the cheapest filter to evaluate and
+saves a page load for URLs already known to be unwanted. The other three operate on the
+job dict once its fields have been extracted and mapped to the output schema. All four
+are no-ops (always pass) when their corresponding config is empty/None.
 """
 
 import re
@@ -26,6 +29,13 @@ def job_text(job: dict) -> str:
     field itself stays raw HTML.
     """
     return f"{job.get('Job Title') or ''} {_strip_html(job.get('Job Description') or '')}"
+
+
+def passes_discarded_urls(url: str, discarded_urls: set) -> bool:
+    """A URL fails if it's in discarded_urls (exact match). No-op if the set is empty."""
+    if not discarded_urls:
+        return True
+    return url not in discarded_urls
 
 
 def passes_location(job: dict, acceptable_locations: list) -> bool:
