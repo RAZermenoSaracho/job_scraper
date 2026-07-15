@@ -9,6 +9,7 @@ import logging
 import random
 import re
 import time
+from collections.abc import Callable
 from urllib.parse import quote
 
 from selenium import webdriver
@@ -52,6 +53,7 @@ class Fw3Scraper:
         anti_keywords: list | None = None,
         discarded_urls: list | None = None,
         max_experience_years: int | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
     ) -> None:
         self.max_jobs_per_keyword = max_jobs_per_keyword
         self.top_n_results = top_n_results
@@ -59,6 +61,7 @@ class Fw3Scraper:
         self.anti_keywords = anti_keywords or []
         self.discarded_urls = set(discarded_urls or [])
         self.max_experience_years = max_experience_years
+        self.on_progress = on_progress
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -75,6 +78,11 @@ class Fw3Scraper:
         Accepts keywords as input; returns a clean list of job dicts matching the
         output schema (Job Title, Company Name, Job Description, Job Location,
         Compensation, Job Url, Tags, Notes). Does not read or write any files.
+
+        If on_progress was passed to __init__, it's called as on_progress(stage, current,
+        total) at the same points this method logs progress — callers (e.g. an API layer
+        tracking a background job) can use it to report progress without this class knowing
+        anything about how that's surfaced.
         """
         driver = self._build_driver()
         ordered_urls: dict = {}  # dict used as an ordered set
@@ -83,7 +91,8 @@ class Fw3Scraper:
         drop_counts = {"discarded_urls": 0, "location": 0, "anti_keywords": 0, "experience": 0}
 
         try:
-            for kw in keywords:
+            for i, kw in enumerate(keywords, start=1):
+                self._report("searching_keywords", i, len(keywords))
                 for url in self.search_by_keyword(driver, kw):
                     ordered_urls[url] = None
 
@@ -95,6 +104,7 @@ class Fw3Scraper:
                     continue
 
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
+                self._report("scraping", n, len(ordered_urls))
                 raw = self.extract_job_detail(driver, url)
                 time.sleep(random.uniform(1, 2))
                 if not raw:
@@ -141,6 +151,7 @@ class Fw3Scraper:
             drop_counts["anti_keywords"],
             drop_counts["experience"],
         )
+        self._report("filtering", len(candidates), len(ordered_urls))
         if selected:
             scores = [score for score, _ in selected]
             log.info(
@@ -230,6 +241,11 @@ class Fw3Scraper:
         return [kw for kw in keywords if kw.lower() in lowered]
 
     # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _report(self, stage: str, current: int, total: int) -> None:
+        """Invoke the optional progress callback, if one was provided."""
+        if self.on_progress:
+            self.on_progress(stage, current, total)
 
     def _build_driver(self) -> webdriver.Chrome:
         opts = Options()

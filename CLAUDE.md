@@ -1,21 +1,24 @@
 # job_scraper
 
-A **fully stateless** FastAPI service that scrapes job boards for roles matching a set of
-keywords, ranks results by keyword relevance, and returns structured JSON over HTTP. There is no
-config file and no server-side scraping config in env vars — every `POST /jobs` request fully
-describes the run (keywords, location/anti-keyword/discarded-URL filters, and limits) in its body.
-Nothing is written to disk; the scraped, filtered, ranked result is returned directly as the HTTP
-response.
+A FastAPI service that scrapes job boards for roles matching a set of keywords, ranks results by
+keyword relevance, and returns structured JSON over HTTP. There is no config file and no
+server-side scraping config in env vars — every `POST /jobs` request fully describes the run
+(keywords, location/anti-keyword/discarded-URL filters, and limits) in its body. Nothing is
+written to disk. Scraping runs as a background task tracked by an in-memory `job_id` (`jobs_status`
+in `app.py`) — the caller polls for progress and fetches the result once it's done, rather than
+holding one HTTP request open for the whole scrape. That job-tracking dict is itself ephemeral
+(in-process, purged after an hour, lost on restart) — it exists only to support polling, not as
+durable state.
 
 ## Project structure
 
 ```
 .
-├── app.py                 # FastAPI app: POST /jobs validates the request body, runs scrapers, returns JSON
+├── app.py                 # FastAPI app: POST /jobs schedules a background scrape; GET .../status and .../result poll it
 ├── utils/
 │   └── filters.py         # Per-candidate filter predicates (discarded URLs, location, anti-keywords, required experience)
 └── scrapers/
-    └── fw3_jobscraper.py  # Fw3Scraper class for findweb3.com — filters + ranks candidates internally
+    └── fw3_jobscraper.py  # Fw3Scraper class for findweb3.com — filters + ranks candidates internally, reports progress
 ```
 
 There is no `keywords.json` and no scraping-related `.env` values — see [API](#api) below for
@@ -72,6 +75,13 @@ Exposes a single class `Fw3Scraper`. Key constraints specific to this site:
   candidates would return "first found," not "most relevant" — a later candidate with a much better
   score wouldn't get a chance to bump out an earlier, weaker one. Drop counts per filter, plus the
   min/max score among the final selection, are logged at the end of `run()`.
+- **Reports progress via an optional callback, not just logs.** The constructor accepts
+  `on_progress: Callable[[str, int, int], None] | None`. `run()` calls `self._report(stage,
+  current, total)` at the same three points it already calls `logger.info` with progress info
+  (once per keyword while searching, once per candidate while scraping, once at the end with the
+  final filtered/passed counts) — `_report` just invokes `on_progress` if one was given. The
+  scraper has zero knowledge of FastAPI, background tasks, or `jobs_status`; `app.py` supplies a
+  closure that writes into `jobs_status[job_id]`.
 
 ### Scraper interface contract
 
@@ -85,12 +95,12 @@ class SomeScraper:
     # no file I/O, no _ fields
 ```
 
-`Fw3Scraper` additionally accepts `acceptable_locations`, `anti_keywords`, `discarded_urls`, and
-`max_experience_years` kwargs (all optional, default to "no filtering") so it can apply
-`utils/filters.py` inline and rank by relevance. Any future scraper that wants the same filtering
-support should accept the same kwargs and apply the same predicates + ranking during its own search
-loop — this isn't (yet) enforced as part of the strict interface contract above, since not every
-scraper will need it.
+`Fw3Scraper` additionally accepts `acceptable_locations`, `anti_keywords`, `discarded_urls`,
+`max_experience_years`, and `on_progress` kwargs (all optional, default to "no filtering" / "no
+progress reporting") so it can apply `utils/filters.py` inline, rank by relevance, and report
+progress. Any future scraper that wants the same support should accept the same kwargs and apply
+the same predicates + ranking + progress calls during its own search loop — this isn't (yet)
+enforced as part of the strict interface contract above, since not every scraper will need it.
 
 `app.py` is solely responsible for validating the request body and shaping the HTTP response. It
 does not filter, score, or otherwise inspect job contents, and it reads no config file or env var
@@ -101,7 +111,7 @@ request body is the only source of scraping config.
 
 1. Create `scrapers/{site}_jobscraper.py` following the interface above.
 2. Instantiate the class in `app.py`'s `_build_scrapers()` function.
-3. No changes to `get_jobs()`'s orchestration loop needed.
+3. No changes to `create_job()` / `_run_scrape_job()`'s orchestration loop needed.
 
 **Multi-scraper top-N note:** each scraper applies its own `top_n_results` cut internally (on its
 own filtered-and-ranked pool). `app.py` concatenates all results as-is. If a global re-rank across
@@ -117,10 +127,17 @@ conda activate job_scraper
 uvicorn app:app --reload
 ```
 
-CORS is wide open (`ALLOWED_ORIGINS = ["*"]` in `app.py`) for development. **Restrict this to the
-real frontend's production domain(s) before deploying either service.**
+CORS is wide open (`ALLOWED_ORIGINS = ["*"]` in `app.py`, applied once via `CORSMiddleware` for the
+whole app — covers all three routes below) for development. **Restrict this to the real frontend's
+production domain(s) before deploying either service.**
 
-### `POST /jobs`
+Scraping is async: `POST /jobs` schedules the work and returns a `job_id`; the caller polls
+`GET /jobs/{job_id}/status` and then fetches `GET /jobs/{job_id}/result`. This exists because a
+full scrape (one page load per keyword, plus one per candidate) can take 2-4 minutes — long enough
+to exceed some edge/tunnel proxy timeouts (e.g. Cloudflare Tunnel) if done synchronously in one
+request/response cycle.
+
+### `POST /jobs` — schedule a scrape
 
 Request body — validated by the `JobsRequest` Pydantic model in `app.py`. **This fully replaces
 `keywords.json` and the scraping env vars** — there is no server-side fallback for any of these:
@@ -152,9 +169,43 @@ this run. Checked as early as possible per candidate (see `passes_discarded_urls
 client re-requesting after discarding some results doesn't pay for re-scraping them.
 
 A malformed body (missing a required field, wrong type) never reaches the handler — FastAPI/Pydantic
-reject it with `422` automatically before `get_jobs()` runs.
+reject it with `422` automatically before `create_job()` runs. Otherwise, this endpoint always
+succeeds with `202 {"job_id": "<uuid4>"}` — a scraper failure surfaces later, via polling, not here.
 
-Response body — same shape previously written to the output JSON file:
+`create_job()`:
+1. Calls `_purge_old_jobs()` (drops any `jobs_status` entries older than `JOB_STATUS_TTL_SECONDS`,
+   currently 1 hour — the only "cleanup" mechanism, no scheduler).
+2. Generates `job_id = str(uuid.uuid4())` and seeds `jobs_status[job_id]` with
+   `{"status": "running", "stage": "starting", "current": 0, "total": 0, "result": None, "error":
+   None, "created_at": time.time()}`.
+3. Schedules `_run_scrape_job(job_id, request)` via `BackgroundTasks.add_task(...)`. `_run_scrape_job`
+   is a plain sync function; Starlette runs sync background callables through its threadpool (not
+   the event loop), so the Selenium calls inside it don't block other requests.
+4. Returns `{"job_id": job_id}` immediately.
+
+`_run_scrape_job` builds a closure `on_progress(stage, current, total)` that does
+`jobs_status[job_id].update(stage=stage, current=current, total=total)`, passes it into
+`_build_scrapers(request, on_progress)`, runs each scraper, and on completion sets
+`jobs_status[job_id]` to `status="done"`, `stage="done"`, and
+`result={"keywords": ..., "jobs": ...}`. If building scrapers or any scraper's `run()` raises, it
+sets `status="error"` and `error="<message>"` instead, and returns without running further
+scrapers.
+
+### `GET /jobs/{job_id}/status` — poll progress
+
+```json
+{"status": "running", "stage": "scraping", "current": 7, "total": 20}
+```
+
+- `status`: `running` | `done` | `error`.
+- `stage`: `starting` → `searching_keywords` → `scraping` → `filtering` → `done` (or `error`).
+- `current`/`total`: stage-relative counters, as reported by the scraper's `on_progress` callback.
+- If `status == "error"`, the body also includes `"error": "<message>"`.
+- `404` if `job_id` isn't in `jobs_status` (never existed, or already purged).
+
+### `GET /jobs/{job_id}/result` — fetch the finished output
+
+Returns the same shape previously written to the output JSON file, once `status == "done"`:
 
 ```json
 {
@@ -180,9 +231,8 @@ Field notes:
 - `Notes` is always `""` — reserved for manual fill-in downstream.
 - `Job Url` points to the listing on the source site (e.g. findweb3.com), not an external application link.
 
-Errors: an unexpected failure while building scrapers returns `500` with
-`{"detail": "Failed to configure scrapers: ..."}`; a scraper raising an exception mid-run returns
-`502` with `{"detail": "Scraper '<name>' failed: ..."}`.
+Errors: `404` if `job_id` is unknown; `409` if `status == "running"` (with a message saying so);
+`500` with the stored error message if `status == "error"`.
 
 ## Environment
 
