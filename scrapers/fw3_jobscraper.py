@@ -67,13 +67,14 @@ class Fw3Scraper:
 
     def run(self, keywords: list) -> list:
         """
-        Full pipeline: scrape all keyword pages → deduplicate → visit every candidate not
-        already in discarded_urls (checked before any page load, to skip known-unwanted
-        URLs without spending an HTTP request on them), filtering each one inline as soon
-        as its fields are extracted. Every candidate that survives all filters is scored
-        by keyword-match count; once all candidates have been visited, the surviving pool
-        is ranked by score and the top_n_results best are returned — not just the first
-        ones found to pass.
+        Full pipeline: scrape all keyword pages → deduplicate → visit every candidate,
+        filtering each one inline as soon as its fields are extracted. discarded_urls is
+        filtered during search itself (see search_by_keyword) so a discarded job never
+        occupies one of the max_jobs_per_keyword slots and never costs a page load; every
+        URL that reaches this stage has already passed that check. Every candidate that
+        survives the remaining filters is scored by keyword-match count; once all
+        candidates have been visited, the surviving pool is ranked by score and the
+        top_n_results best are returned — not just the first ones found to pass.
 
         Accepts keywords as input; returns a clean list of job dicts matching the
         output schema (Job Title, Company Name, Job Description, Job Location,
@@ -93,16 +94,14 @@ class Fw3Scraper:
         try:
             for i, kw in enumerate(keywords, start=1):
                 self._report("searching_keywords", i, len(keywords))
-                for url in self.search_by_keyword(driver, kw):
+                urls, discarded_count = self.search_by_keyword(driver, kw)
+                drop_counts["discarded_urls"] += discarded_count
+                for url in urls:
                     ordered_urls[url] = None
 
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
 
             for n, url in enumerate(ordered_urls, start=1):
-                if not passes_discarded_urls(url, self.discarded_urls):
-                    drop_counts["discarded_urls"] += 1
-                    continue
-
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
                 self._report("scraping", n, len(ordered_urls))
                 raw = self.extract_job_detail(driver, url)
@@ -141,10 +140,11 @@ class Fw3Scraper:
         candidates.sort(key=lambda pair: pair[0], reverse=True)
         selected = candidates[: self.top_n_results]
 
+        total_seen = len(ordered_urls) + drop_counts["discarded_urls"]
         log.info(
-            "Filtered %d candidate(s): %d passed "
+            "Filtered %d candidate(s) found: %d passed "
             "(dropped — discarded_urls: %d, location: %d, anti_keywords: %d, experience: %d)",
-            len(ordered_urls),
+            total_seen,
             len(candidates),
             drop_counts["discarded_urls"],
             drop_counts["location"],
@@ -161,10 +161,17 @@ class Fw3Scraper:
 
         return [job for _, job in selected]
 
-    def search_by_keyword(self, driver: webdriver.Chrome, keyword: str) -> list:
+    def search_by_keyword(self, driver: webdriver.Chrome, keyword: str) -> tuple[list, int]:
         """
         Load the findweb3.com listing page for a keyword and return up to
-        self.max_jobs_per_keyword job-detail URLs (/job/<id> pattern).
+        self.max_jobs_per_keyword job-detail URLs (/job/<id> pattern), as
+        (job_urls, discarded_count).
+
+        Discarded URLs are skipped as they're encountered, before they can consume one
+        of the max_jobs_per_keyword slots — scanning continues over further links on
+        the page until that many valid URLs are collected, or the page's links run out.
+        This is a single already-loaded page's DOM, so "keep looking" costs nothing
+        extra over the network; it just means not stopping the scan early.
 
         Multi-word keywords (e.g. "smart contracts") are hyphenated for the URL.
         """
@@ -180,20 +187,27 @@ class Fw3Scraper:
             time.sleep(random.uniform(1.5, 2.5))
         except TimeoutException:
             log.warning("Timeout loading '%s'", url)
-            return []
+            return [], 0
 
         job_urls = []
         seen = set()
+        discarded_count = 0
         for a in driver.find_elements(By.TAG_NAME, "a"):
             href = (a.get_attribute("href") or "").strip()
-            if re.search(r"findweb3\.com/job/[^/]+$", href) and href not in seen:
-                seen.add(href)
-                job_urls.append(href)
-                if len(job_urls) >= self.max_jobs_per_keyword:
-                    break
+            if not re.search(r"findweb3\.com/job/[^/]+$", href) or href in seen:
+                continue
+            seen.add(href)
 
-        log.info("  → %d job link(s) found", len(job_urls))
-        return job_urls
+            if not passes_discarded_urls(href, self.discarded_urls):
+                discarded_count += 1
+                continue
+
+            job_urls.append(href)
+            if len(job_urls) >= self.max_jobs_per_keyword:
+                break
+
+        log.info("  → %d job link(s) found (%d discarded)", len(job_urls), discarded_count)
+        return job_urls, discarded_count
 
     def extract_job_detail(self, driver: webdriver.Chrome, job_url: str) -> dict | None:
         """

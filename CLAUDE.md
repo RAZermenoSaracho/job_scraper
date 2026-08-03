@@ -34,9 +34,10 @@ Exposes four per-candidate **predicate** functions, all no-ops (always pass) whe
 corresponding config is empty/`None`:
 
 1. **`passes_discarded_urls(url, discarded_urls)`** — operates on the raw candidate URL string
-   (a `set`), not a job dict. Fails if `url` is in `discarded_urls`. Scrapers check this **before**
-   making any HTTP request for the candidate's detail page — it's the cheapest filter, so it runs
-   first and skips a page load entirely for already-unwanted URLs.
+   (a `set`), not a job dict. Fails if `url` is in `discarded_urls`. Scrapers check this during
+   **search** (link collection), not during the later per-candidate visit loop — a discarded URL
+   must never consume one of the `max_jobs_per_keyword` slots, otherwise the same discarded jobs
+   get "found" (and re-counted against the limit) on every run, crowding out undiscovered ones.
 2. **`passes_location(job, acceptable_locations)`** — passes if `Job Location` is empty/`None`
    (unknown location isn't disqualifying), or contains (case-insensitive substring) any entry from
    `acceptable_locations`.
@@ -64,13 +65,19 @@ Exposes a single class `Fw3Scraper`. Key constraints specific to this site:
 - `Company Name` and `Job Description` are extracted from the job detail page via best-effort
   XPath selectors (class/data-testid containing "company"/"description"); `Job Description` is
   stored as raw HTML, unsanitized — no plain-text conversion is done in the scraper.
-- **Filters inline, then ranks.** `run()` visits every candidate URL found during search (up to
-  `max_jobs_per_keyword` per keyword). For each: `passes_discarded_urls` is checked first, before
-  any page load. If it passes, the candidate's fields are extracted and mapped to the output
-  schema, then run through `passes_location` → `passes_anti_keywords` → `passes_experience`.
-  Rejected candidates are dropped immediately. A candidate that survives all four is scored (count
-  of unique `keywords` matches in its `job_text`), and only *after every candidate has been
-  visited* is the surviving pool sorted by score (descending) and cut down to the best
+- **Discards during search, not after.** `search_by_keyword` skips any link already in
+  `discarded_urls` as it scans the listing page's `<a>` tags, and keeps scanning further links
+  until it has `max_jobs_per_keyword` valid ones or the page's links run out — a discarded URL
+  never occupies one of those slots, so new postings can naturally replace discarded ones instead
+  of the same discarded jobs getting re-found (and re-counted against the limit) every run. This
+  costs no extra requests: the listing page is already fully loaded in the DOM, so "keep scanning"
+  just means not breaking the loop early.
+- **Filters inline, then ranks.** `run()` visits every candidate URL returned by search (each one
+  has already passed `passes_discarded_urls`). The candidate's fields are extracted and mapped to
+  the output schema, then run through `passes_location` → `passes_anti_keywords` →
+  `passes_experience`. Rejected candidates are dropped immediately. A candidate that survives all
+  three is scored (count of unique `keywords` matches in its `job_text`), and only *after every
+  candidate has been visited* is the surviving pool sorted by score (descending) and cut down to the best
   `top_n_results`. This is deliberate: stopping early at the first `top_n_results` passing
   candidates would return "first found," not "most relevant" — a later candidate with a much better
   score wouldn't get a chance to bump out an earlier, weaker one. Drop counts per filter, plus the
@@ -165,8 +172,10 @@ Request body — validated by the `JobsRequest` Pydantic model in `app.py`. **Th
 | `max_experience_years` | yes | — |
 
 `discarded_urls` — job URLs (as previously returned in a job's `Job Url` field) to exclude from
-this run. Checked as early as possible per candidate (see `passes_discarded_urls` above), so a
-client re-requesting after discarding some results doesn't pay for re-scraping them.
+this run. Filtered during search itself (see `passes_discarded_urls` above), not just before
+re-scraping a candidate's detail page — so a discarded URL never occupies one of the
+`max_jobs_searched_per_keyword` slots, and a client re-requesting after discarding some results
+gets that many slots backfilled with newly-discoverable postings instead of just a smaller result.
 
 A malformed body (missing a required field, wrong type) never reaches the handler — FastAPI/Pydantic
 reject it with `422` automatically before `create_job()` runs. Otherwise, this endpoint always

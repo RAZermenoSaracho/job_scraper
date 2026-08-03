@@ -99,21 +99,19 @@ A request missing a required field, or with the wrong type, gets rejected by Fas
 
 ## Filtering
 
-Filtering happens **inside each scraper**, inline while it visits candidates — not in `app.py`
-after the fact. `Fw3Scraper` runs each candidate through four filter predicates from
-[utils/filters.py](utils/filters.py), in this order:
+`discarded_urls` is filtered **during search**, not afterward — see
+[Discarding already-seen URLs](#discarding-already-seen-urls-without-shrinking-the-search) below.
+The other three filters happen **inside each scraper**, inline while it visits candidates that
+survived the search-time discard check, not in `app.py` after the fact. `Fw3Scraper` runs each
+candidate through three filter predicates from [utils/filters.py](utils/filters.py), in this order:
 
-1. **`passes_discarded_urls`** — checked first, on the raw candidate URL, **before** any page load
-   for that candidate. Fails if the URL is in `discarded_urls`. This is the cheapest filter and
-   saves an HTTP request to the target site for URLs the caller already doesn't want (e.g. a
-   frontend re-requesting after the user dismissed some results). No-op if `discarded_urls` is `[]`.
-2. **`passes_location`** — passes if `Job Location` is empty/unknown, or contains (case-insensitive
+1. **`passes_location`** — passes if `Job Location` is empty/unknown, or contains (case-insensitive
    substring) any entry from `acceptable_locations`; fails otherwise. No-op if `acceptable_locations`
    is `[]`.
-3. **`passes_anti_keywords`** — fails if `Job Title` + plain-text `Job Description` (HTML stripped,
+2. **`passes_anti_keywords`** — fails if `Job Title` + plain-text `Job Description` (HTML stripped,
    for matching only — the stored field stays raw HTML) contains any `anti_keywords` entry. No-op
    if the list is `[]`.
-4. **`passes_experience`** — scans the same title + description text for "years of experience"
+3. **`passes_experience`** — scans the same title + description text for "years of experience"
    mentions (`"N+ years"`, `"N-M years"`, plain `"N years"` — which also covers `"at least N years"`
    / `"minimum of N years"`). For a range, only the **minimum** is compared: a job asking for
    `"3-7 years"` passes if `max_experience_years` is `4`, since you clear the 3-year floor. Fails
@@ -121,14 +119,25 @@ after the fact. `Fw3Scraper` runs each candidate through four filter predicates 
    pass.
 
 A candidate that fails any filter is dropped immediately and the scraper moves on to the next
-candidate URL. Filters 2–4 only run once a candidate has already passed the URL check and had its
-fields extracted.
+candidate URL.
+
+### Discarding already-seen URLs without shrinking the search
+
+`passes_discarded_urls` runs inside `search_by_keyword` itself, as it scans the listing page's
+links — **before** a URL is even added to the candidate pool, let alone before its detail page is
+loaded. This matters: if discarding only happened later (during the candidate-visit loop), a
+discarded URL would still have consumed one of the `max_jobs_searched_per_keyword` slots during
+search, so every re-request with the same `discarded_urls` would "find" the same already-discarded
+jobs again and again, permanently crowding out undiscovered ones. Instead, `search_by_keyword` skips
+discarded links as it encounters them and keeps scanning further links on the (already fully
+loaded) page until it has `max_jobs_searched_per_keyword` valid ones, or the page's links run out —
+so it costs no extra network requests, just a wider scan of the same page.
 
 ### Ranking (evaluate all, then pick the best N)
 
 The scraper does **not** stop as soon as it has `max_jobs_saved` passing candidates. It visits
-*every* candidate found during search (up to `max_jobs_searched_per_keyword` per keyword, minus
-any skipped via `discarded_urls`), and each one that survives the other three filters gets a
+*every* candidate returned by search (up to `max_jobs_searched_per_keyword` per keyword, already
+excluding anything in `discarded_urls`), and each one that survives the other three filters gets a
 relevance score — the count of unique `keywords` matched in its title + description. Only after all
 candidates have been visited does it sort the surviving pool by score (descending) and return the
 best `max_jobs_saved`. This matters because stopping early at the first N passing candidates would
@@ -138,7 +147,7 @@ chance to bump out a weaker, earlier one.
 Each scraper logs drop counts per filter, plus the score range of its final selection, e.g.:
 
 ```
-13:32:50 [INFO] Filtered 40 candidate(s): 12 passed (dropped — discarded_urls: 6, location: 15, anti_keywords: 2, experience: 5)
+13:32:50 [INFO] Filtered 40 candidate(s) found: 12 passed (dropped — discarded_urls: 6, location: 15, anti_keywords: 2, experience: 5)
 13:32:50 [INFO] Selected top 5 of 12 passing candidate(s) — score min: 3, max: 8
 ```
 
@@ -251,11 +260,13 @@ its own `max_jobs_saved` (see [Filtering](#filtering) above). Field notes:
 
 If the new scraper should support the same discarded-URL/location/anti-keyword/experience
 filtering and best-of-N ranking, accept `acceptable_locations`, `anti_keywords`, `discarded_urls`,
-and `max_experience_years` in its `__init__`, apply the predicates from `utils/filters.py` inline
-in its own search loop (checking `discarded_urls` first, before any page load), and rank all
-surviving candidates by score before cutting to `top_n_results` — the same way `Fw3Scraper` does.
-If it should report progress too, accept an `on_progress(stage, current, total)` kwarg and call it
-at the same points it would otherwise `logger.info` progress.
+and `max_experience_years` in its `__init__`; filter `discarded_urls` during its own search/listing
+step (not afterward — see [Discarding already-seen URLs](#discarding-already-seen-urls-without-shrinking-the-search)
+above) so a discarded URL never consumes one of its search slots; apply the other three predicates
+from `utils/filters.py` inline per candidate; and rank all surviving candidates by score before
+cutting to `top_n_results` — the same way `Fw3Scraper` does. If it should report progress too,
+accept an `on_progress(stage, current, total)` kwarg and call it at the same points it would
+otherwise `logger.info` progress.
 
 No changes to `create_job()`'s orchestration loop in `app.py` are needed — it just iterates
 `_build_scrapers(request, on_progress)` and concatenates results.
