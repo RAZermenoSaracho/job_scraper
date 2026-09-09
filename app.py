@@ -20,7 +20,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from scrapers import Fw3Scraper
+from scrapers import Fw3Scraper, Web3CareerScraper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +81,15 @@ def _build_scrapers(
     """
     return [
         ("findweb3.com", Fw3Scraper(
+            max_jobs_per_keyword=request.max_jobs_searched_per_keyword,
+            top_n_results=request.max_jobs_saved,
+            acceptable_locations=request.acceptable_locations,
+            anti_keywords=request.anti_keywords,
+            discarded_urls=request.discarded_urls,
+            max_experience_years=request.max_experience_years,
+            on_progress=on_progress,
+        )),
+        ("web3.career", Web3CareerScraper(
             max_jobs_per_keyword=request.max_jobs_searched_per_keyword,
             top_n_results=request.max_jobs_saved,
             acceptable_locations=request.acceptable_locations,

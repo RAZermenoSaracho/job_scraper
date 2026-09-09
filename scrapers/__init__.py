@@ -1,1 +1,2 @@
 from scrapers.fw3_jobscraper import Fw3Scraper
+from scrapers.web3career_jobscraper import Web3CareerScraper
