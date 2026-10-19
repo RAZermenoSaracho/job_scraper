@@ -10,6 +10,7 @@ captured during manual research against the live site.
 import requests
 
 import scrapers.web3career_jobscraper as w3mod
+import scrapers.base as basemod
 from scrapers.web3career_jobscraper import Web3CareerScraper
 from utils import filters as filters_mod
 
@@ -395,20 +396,20 @@ class TestRun:
     def test_filters_applied_in_order_location_then_anti_keywords_then_experience(self, monkeypatch):
         call_order = []
         real_location, real_anti, real_experience = (
-            w3mod.passes_location,
-            w3mod.passes_anti_keywords,
-            w3mod.passes_experience,
+            basemod.passes_location,
+            basemod.passes_anti_keywords,
+            basemod.passes_experience,
         )
         monkeypatch.setattr(
-            w3mod, "passes_location",
+            basemod, "passes_location",
             lambda job, locs: call_order.append("location") or real_location(job, locs),
         )
         monkeypatch.setattr(
-            w3mod, "passes_anti_keywords",
-            lambda job, kw: call_order.append("anti_keywords") or real_anti(job, kw),
+            basemod, "passes_anti_keywords",
+            lambda job, kw, *a: call_order.append("anti_keywords") or real_anti(job, kw),
         )
         monkeypatch.setattr(
-            w3mod, "passes_experience",
+            basemod, "passes_experience",
             lambda job, yrs: call_order.append("experience") or real_experience(job, yrs),
         )
 
@@ -432,20 +433,20 @@ class TestRun:
     def test_location_failure_short_circuits_remaining_filters(self, monkeypatch):
         call_order = []
         real_location, real_anti, real_experience = (
-            w3mod.passes_location,
-            w3mod.passes_anti_keywords,
-            w3mod.passes_experience,
+            basemod.passes_location,
+            basemod.passes_anti_keywords,
+            basemod.passes_experience,
         )
         monkeypatch.setattr(
-            w3mod, "passes_location",
+            basemod, "passes_location",
             lambda job, locs: call_order.append("location") or real_location(job, locs),
         )
         monkeypatch.setattr(
-            w3mod, "passes_anti_keywords",
-            lambda job, kw: call_order.append("anti_keywords") or real_anti(job, kw),
+            basemod, "passes_anti_keywords",
+            lambda job, kw, *a: call_order.append("anti_keywords") or real_anti(job, kw),
         )
         monkeypatch.setattr(
-            w3mod, "passes_experience",
+            basemod, "passes_experience",
             lambda job, yrs: call_order.append("experience") or real_experience(job, yrs),
         )
 
@@ -579,3 +580,59 @@ class TestNormalizedRow:
         assert results[0]["source_job_id"] == results[1]["source_job_id"] == "153659"
         assert results[0]["canonical_url"] == url
         assert results[0]["posted_at"] == "2026-10-12T06:30:00Z"
+
+
+class TestKnownKeysDeadlineAndFilters:
+    def test_known_url_takes_no_slot_and_causes_no_detail_request(self, monkeypatch):
+        page1 = search_page(["/job-a/1", "/job-b/2", "/job-c/3"])
+        session = FakeSession({"https://web3.career/python-jobs?page=1": FakeResponse(page1)})
+        scraper = make_scraper(max_jobs_per_keyword=2, known_keys=["web3career:1"])
+
+        urls, skipped = scraper.search_by_keyword(session, "python")
+
+        assert urls == ["https://web3.career/job-b/2", "https://web3.career/job-c/3"]
+        assert skipped == 1
+        assert session.calls == ["https://web3.career/python-jobs?page=1"]  # no detail page fetched
+
+    def test_known_canonical_url_form_is_skipped(self):
+        page1 = search_page(["/job-a/1"])
+        session = FakeSession({"https://web3.career/python-jobs?page=1": FakeResponse(page1)})
+        scraper = make_scraper(known_keys=["https://web3.career/job-a/1?utm_source=x"])
+
+        assert scraper.search_by_keyword(session, "python") == ([], 1)
+
+    def test_known_dedupe_key_excluded_after_fetch(self, monkeypatch):
+        scraper = Web3CareerScraper(known_keys=["some co|role|remote"])
+        monkeypatch.setattr(scraper, "_build_session", lambda: FakeSession())
+        monkeypatch.setattr(scraper, "search_by_keyword", lambda s, kw: (["https://web3.career/r/5"], 0))
+        monkeypatch.setattr(scraper, "extract_job_detail", lambda s, u: raw_job(u, "kw1"))
+
+        assert scraper.run(["kw1"]) == []
+
+    def test_new_filters_and_word_mode_applied(self, monkeypatch):
+        urls = [f"https://web3.career/r/{i}" for i in (1, 2, 3, 4)]
+        raws = {
+            urls[0]: dict(raw_job(urls[0], "kw1 go", title="Senior Dev"), posted_at="2026-10-10T00:00:00Z"),
+            urls[1]: dict(raw_job(urls[1], "kw1 mongodb", title="Dev"), posted_at="2026-09-01T00:00:00Z"),
+            urls[2]: dict(raw_job(urls[2], "kw1 mongodb", title="Dev", location="Berlin (onsite)")),
+            urls[3]: dict(raw_job(urls[3], "kw1 mongodb", title="Dev"), posted_at="2026-10-12T00:00:00Z"),
+        }
+        scraper = Web3CareerScraper(
+            match_mode="word", anti_keywords=["go"], seniority_exclude=["senior"],
+            since="2026-10-01T00:00:00Z", work_modes=["remote"],
+        )
+        monkeypatch.setattr(scraper, "_build_session", lambda: FakeSession())
+        monkeypatch.setattr(scraper, "search_by_keyword", lambda s, kw: (urls, 0))
+        monkeypatch.setattr(scraper, "extract_job_detail", lambda s, u: raws[u])
+
+        # job1: anti "go"/seniority; job2: older than since; job3: onsite; job4 passes all
+        assert [j["Job Url"] for j in scraper.run(["kw1"])] == [urls[3]]
+
+    def test_deadline_stops_before_any_fetch_and_is_flagged(self, monkeypatch):
+        scraper = Web3CareerScraper(deadline=0.0)  # monotonic clock is always past 0
+        monkeypatch.setattr(scraper, "_build_session", lambda: FakeSession())
+        called = []
+        monkeypatch.setattr(scraper, "search_by_keyword", lambda s, kw: called.append(kw) or ([], 0))
+
+        assert scraper.run(["kw1"]) == []
+        assert called == [] and scraper.deadline_hit is True

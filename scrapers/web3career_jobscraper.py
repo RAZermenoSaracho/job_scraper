@@ -28,20 +28,13 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable
 from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
 
-from utils.filters import (
-    job_text,
-    passes_anti_keywords,
-    passes_discarded_urls,
-    passes_experience,
-    passes_location,
-)
-from utils.normalize import build_row, identify_url, set_tags
+from scrapers.base import BaseScraper
+from utils.normalize import build_row, identify_url
 
 log = logging.getLogger(__name__)
 
@@ -54,28 +47,10 @@ USER_AGENT = (
 _JOB_HREF_PATTERN = re.compile(r'href="(/[a-z0-9-]+/\d+)"')
 
 
-class Web3CareerScraper:
+class Web3CareerScraper(BaseScraper):
     """Scraper for web3.career job listings."""
 
     _MAX_PAGES = 20  # safety cap on pagination per keyword, in case the site never signals "done"
-
-    def __init__(
-        self,
-        max_jobs_per_keyword: int = 20,
-        top_n_results: int = 10,
-        acceptable_locations: list | None = None,
-        anti_keywords: list | None = None,
-        discarded_urls: list | None = None,
-        max_experience_years: int | None = None,
-        on_progress: Callable[[str, int, int], None] | None = None,
-    ) -> None:
-        self.max_jobs_per_keyword = max_jobs_per_keyword
-        self.top_n_results = top_n_results
-        self.acceptable_locations = acceptable_locations or []
-        self.anti_keywords = anti_keywords or []
-        self.discarded_urls = set(discarded_urls or [])
-        self.max_experience_years = max_experience_years
-        self.on_progress = on_progress
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -83,29 +58,32 @@ class Web3CareerScraper:
         """
         Same pipeline as Fw3Scraper.run(): scrape all keyword pages → deduplicate →
         visit every candidate, filtering each inline as soon as its fields are
-        extracted (passes_location → passes_anti_keywords → passes_experience), score
-        survivors by keyword-match count, then rank and cut to top_n_results only after
-        every candidate has been visited. discarded_urls is filtered during search
-        itself (see search_by_keyword) so a discarded job never occupies one of the
-        max_jobs_per_keyword slots.
+        extracted (BaseScraper.evaluate), score survivors by keyword-match count, then
+        rank and cut to top_n_results only after every candidate has been visited.
+        discarded_urls and known_keys are filtered during search itself (see
+        search_by_keyword) so such a job never occupies one of the max_jobs_per_keyword
+        slots or costs a detail request. Stops early when the run deadline passes.
         """
         session = self._build_session()
         ordered_urls: dict = {}
-
         candidates: list = []
-        drop_counts = {"discarded_urls": 0, "location": 0, "anti_keywords": 0, "experience": 0}
+        drops: dict = {"discarded_urls": 0}
 
         try:
             for i, kw in enumerate(keywords, start=1):
+                if self.expired():
+                    break
                 self._report("searching_keywords", i, len(keywords))
                 urls, discarded_count = self.search_by_keyword(session, kw)
-                drop_counts["discarded_urls"] += discarded_count
+                drops["discarded_urls"] += discarded_count
                 for url in urls:
                     ordered_urls[url] = None
 
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
 
             for n, url in enumerate(ordered_urls, start=1):
+                if self.expired():
+                    break
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
                 self._report("scraping", n, len(ordered_urls))
                 raw = self.extract_job_detail(session, url)
@@ -126,48 +104,13 @@ class Web3CareerScraper:
                     source_job_id=identify_url(raw["url"])["source_job_id"],
                     posted_at=raw.get("posted_at"),
                 )
-
-                if not passes_location(job, self.acceptable_locations):
-                    drop_counts["location"] += 1
-                    continue
-                if not passes_anti_keywords(job, self.anti_keywords):
-                    drop_counts["anti_keywords"] += 1
-                    continue
-                if not passes_experience(job, self.max_experience_years):
-                    drop_counts["experience"] += 1
-                    continue
-
-                tags = self.match_keywords(job_text(job), keywords)
-                set_tags(job, tags)
-
-                candidates.append((len(tags), job))
-
+                score = self.evaluate(job, keywords, drops)
+                if score is not None:
+                    candidates.append((score, job))
         finally:
             session.close()
 
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        selected = candidates[: self.top_n_results]
-
-        total_seen = len(ordered_urls) + drop_counts["discarded_urls"]
-        log.info(
-            "Filtered %d candidate(s) found: %d passed "
-            "(dropped — discarded_urls: %d, location: %d, anti_keywords: %d, experience: %d)",
-            total_seen,
-            len(candidates),
-            drop_counts["discarded_urls"],
-            drop_counts["location"],
-            drop_counts["anti_keywords"],
-            drop_counts["experience"],
-        )
-        self._report("filtering", len(candidates), len(ordered_urls))
-        if selected:
-            scores = [score for score, _ in selected]
-            log.info(
-                "Selected top %d of %d passing candidate(s) — score min: %d, max: %d",
-                len(selected), len(candidates), min(scores), max(scores),
-            )
-
-        return [job for _, job in selected]
+        return self.select(candidates, drops, len(ordered_urls))
 
     def search_by_keyword(self, session: requests.Session, keyword: str) -> tuple[list, int]:
         """
@@ -211,7 +154,7 @@ class Web3CareerScraper:
                 seen.add(full_url)
                 found_new = True
 
-                if not passes_discarded_urls(full_url, self.discarded_urls):
+                if self.skip_url(full_url):
                     discarded_count += 1
                     continue
 
@@ -261,18 +204,7 @@ class Web3CareerScraper:
             "posted_at": posting.get("datePosted"),
         }
 
-    @staticmethod
-    def match_keywords(text: str, keywords: list) -> list:
-        """Return the subset of keywords (original casing) present in text (case-insensitive)."""
-        lowered = text.lower()
-        return [kw for kw in keywords if kw.lower() in lowered]
-
     # ── Private helpers ────────────────────────────────────────────────────────
-
-    def _report(self, stage: str, current: int, total: int) -> None:
-        """Invoke the optional progress callback, if one was provided."""
-        if self.on_progress:
-            self.on_progress(stage, current, total)
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
