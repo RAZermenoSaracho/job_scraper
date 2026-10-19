@@ -304,6 +304,16 @@ class TestExtractJobDetail:
         assert result["description_html"] == "<p>Great role</p>"
         assert result["url"] == "https://web3.career/job/1"
 
+    def test_extracts_date_posted_from_json_ld(self):
+        html = detail_page().replace(
+            '"description":"plain', '"datePosted":"2026-10-12T08:30:00+00:00","description":"plain'
+        )
+        session = FakeSession({"https://web3.career/job/1": FakeResponse(html)})
+
+        result = make_scraper().extract_job_detail(session, "https://web3.career/job/1")
+
+        assert result["posted_at"] == "2026-10-12T08:30:00+00:00"
+
     def test_missing_optional_fields_default_to_none(self):
         html = detail_page(location_label=None, compensation_label=None, description=None)
         session = FakeSession({"https://web3.career/job/1": FakeResponse(html)})
@@ -496,10 +506,17 @@ class TestRun:
         result = scraper.run(["kw1"])
 
         assert len(result) == 1
-        assert set(result[0].keys()) == {
-            "Job Title", "Company Name", "Job Description", "Job Location",
-            "Compensation", "Job Url", "Tags", "Notes",
-        }
+        legacy = {"Job Title", "Company Name", "Job Description", "Job Location",
+                  "Compensation", "Job Url", "Tags", "Notes"}
+        normalized = {"source", "source_job_id", "canonical_url", "apply_url", "company", "title",
+                      "location", "work_mode", "posted_at", "description_html", "description_text",
+                      "salary", "ats_type", "tags", "dedupe_key"}
+        assert set(result[0].keys()) == legacy | normalized
+        # Legacy values keep their meaning next to the additive normalized fields.
+        assert result[0]["Job Url"] == "url1"
+        assert result[0]["Job Description"] == "kw1 description"
+        assert result[0]["Tags"] == "kw1" and result[0]["tags"] == ["kw1"]
+        assert result[0]["source"] == "web3career"
         assert result[0]["Notes"] == ""
 
     def test_individual_job_extraction_failure_is_skipped_not_fatal(self, monkeypatch):
@@ -545,3 +562,20 @@ class TestRun:
         ]
         assert [e for e in events if e[0] == "scraping"] == [("scraping", 1, 1)]
         assert len([e for e in events if e[0] == "filtering"]) == 1
+
+
+class TestNormalizedRow:
+    def test_stable_id_and_canonical_url_from_posting_url(self, monkeypatch):
+        url = "https://web3.career/staff-engineer-acme/153659"
+        raw = dict(raw_job(url, "kw1"), posted_at="2026-10-12T08:30:00+02:00")
+        results = []
+        for _ in range(2):  # same posting, two runs
+            scraper = Web3CareerScraper()
+            monkeypatch.setattr(scraper, "_build_session", lambda: FakeSession())
+            monkeypatch.setattr(scraper, "search_by_keyword", lambda s, kw: ([url], 0))
+            monkeypatch.setattr(scraper, "extract_job_detail", lambda s, u: raw)
+            results.append(scraper.run(["kw1"])[0])
+
+        assert results[0]["source_job_id"] == results[1]["source_job_id"] == "153659"
+        assert results[0]["canonical_url"] == url
+        assert results[0]["posted_at"] == "2026-10-12T06:30:00Z"
