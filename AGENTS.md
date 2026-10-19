@@ -206,7 +206,7 @@ pip install -r requirements.txt
 ```
 
 - Key dependencies expected in this project: `selenium`, `webdriver-manager` (for automatic ChromeDriver management in headless scraping — pulls in `python-dotenv` as its own transitive dependency, not something `app.py` uses), `fastapi` and `uvicorn` (for the HTTP API).
-- **No env vars configure scraping** (no `MAX_JOBS_SEARCHED_PER_KEYWORD`, `MAX_JOBS_SAVED`, `MAX_EXPERIENCE_YEARS`, or `OUTPUT_DIR` — all removed). Everything scraping-related comes from the `POST /jobs` request body, every request, with no fallback. Any env vars for how the server itself runs (host/port, etc.) are unrelated to this and would be passed to `uvicorn` directly (e.g. `uvicorn app:app --host 0.0.0.0 --port 8000`).
+- **No env vars configure scraping** (no `MAX_JOBS_SEARCHED_PER_KEYWORD`, `MAX_JOBS_SAVED`, `MAX_EXPERIENCE_YEARS`, or `OUTPUT_DIR` — all removed). Everything scraping-related comes from the `POST /jobs` request body, every request, with no fallback. Any env vars for how the server itself runs (host/port, etc.) are unrelated to this and would be passed to `uvicorn` directly (e.g. `uvicorn app:app --host 0.0.0.0 --port 8420`).
 
 ## Conventions
 
