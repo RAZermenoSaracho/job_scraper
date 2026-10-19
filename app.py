@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from scrapers import DEFAULT_SOURCES, SOURCES, catalog, source_state
+from scrapers import DEFAULT_SOURCES, SOURCES, adapter_for, catalog, source_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,7 +131,7 @@ def _build_scrapers(
         match_mode=request.match_mode,
     )
     scrapers = [
-        (sid, SOURCES[sid]["adapter"](**kwargs))
+        (sid, adapter_for(sid, request.sources is not None)(**kwargs))
         for sid in source_ids if SOURCES[sid]["category"] != "ats"
     ]
     # ATS adapters run only for the vendors of the requested boards (and, if `sources` is

@@ -15,6 +15,8 @@ import os
 
 from scrapers.ats_scraper import AshbyScraper, GreenhouseScraper, LeverScraper
 from scrapers.fw3_jobscraper import Fw3Scraper
+from scrapers.hashtagweb3_feed import HashtagWeb3Scraper
+from scrapers.web3career_api import Web3CareerApiScraper
 from scrapers.web3career_jobscraper import Web3CareerScraper
 
 FILTERS = ["location", "anti_keywords", "experience", "since", "work_mode", "seniority",
@@ -29,10 +31,45 @@ SOURCES = {
         "availability": "available", "needs_browser": True, "requires_config": None,
         "filters": FILTERS, "hosts": ["findweb3.com"], "ingestion": None,
     },
+    # Official API adapter; executable only when the token is configured. The legacy HTML
+    # scraper stays the default for requests that omit `sources` (see adapter_for).
     "web3career": {
-        "adapter": Web3CareerScraper, "label": "web3.career", "category": "job_board",
-        "availability": "available", "needs_browser": False, "requires_config": None,
+        "adapter": Web3CareerApiScraper, "legacy_adapter": Web3CareerScraper, "label": "web3.career",
+        "category": "job_board", "availability": "available", "needs_browser": False,
+        "requires_config": "token:WEB3CAREER_API_TOKEN",
         "filters": FILTERS, "hosts": ["web3.career"], "ingestion": None,
+    },
+    "hashtagweb3": {
+        "adapter": HashtagWeb3Scraper, "label": "Hashtag Web3", "category": "job_board",
+        "availability": "available", "needs_browser": False, "requires_config": None,
+        "filters": FILTERS, "hosts": ["hashtagweb3.com"], "ingestion": None,
+    },
+    # Catalog-only: never fetched, scraped or browsed by this service (terms prohibit
+    # automated access); ingestion is the user pasting a job URL into Odoo.
+    "linkedin": {
+        "adapter": None, "label": "LinkedIn", "category": "job_board", "availability": "manual",
+        "needs_browser": False, "requires_config": None, "filters": [], "hosts": ["linkedin.com"],
+        "ingestion": "Paste the job URL into Odoo (LinkedIn User Agreement section 8.2 and robots.txt prohibit automated access).",
+    },
+    "wellfound": {
+        "adapter": None, "label": "Wellfound", "category": "job_board", "availability": "manual",
+        "needs_browser": False, "requires_config": None, "filters": [], "hosts": ["wellfound.com"],
+        "ingestion": "Paste the job URL into Odoo (Wellfound terms III(4),(6) prohibit scraping).",
+    },
+    "bitcoinerjobs": {
+        "adapter": None, "label": "Bitcoiner Jobs", "category": "job_board", "availability": "manual",
+        "needs_browser": False, "requires_config": None, "filters": [], "hosts": ["bitcoinerjobs.com"],
+        "ingestion": "Paste the job URL into Odoo (terms ban robots/spiders; automate only with written permission or a feed).",
+    },
+    "laborx": {
+        "adapter": None, "label": "LaborX", "category": "job_board", "availability": "manual",
+        "needs_browser": False, "requires_config": None, "filters": [], "hosts": ["laborx.com"],
+        "ingestion": "Paste the job URL into Odoo (terms section 4 1.1(h): any automated use is prohibited).",
+    },
+    "cyfrin": {
+        "adapter": None, "label": "Cyfrin Jobs", "category": "job_board", "availability": "defunct",
+        "needs_browser": False, "requires_config": None, "filters": [], "hosts": ["jobs.cyfrin.io"],
+        "ingestion": "Closed 2025-12-09; nothing to ingest.",
     },
     # ATS boards are selected via the request's `boards` list ("<ats>:<token>").
     "greenhouse": {
@@ -63,6 +100,22 @@ def source_state(source_id: str) -> tuple[bool, str | None, str]:
     if config.startswith("token:") and not os.environ.get(config[6:]):
         return False, f"{config[6:]} not set", "planned"
     return True, None, availability
+
+
+def adapter_for(source_id: str, explicit: bool):
+    """
+    Adapter class for a registry id. Requests that omit `sources` (explicit=False) keep the
+    legacy web3.career HTML scraper — the existing frontend's path — unless the API token
+    is configured AND env WEB3CAREER_LEGACY_SCRAPER is switched off (0/false/no/off):
+    that flag is the cut-over to the official API adapter.
+    """
+    entry = SOURCES[source_id]
+    legacy = entry.get("legacy_adapter")
+    if legacy and not explicit:
+        flag = os.environ.get("WEB3CAREER_LEGACY_SCRAPER", "1").strip().lower()
+        if flag not in ("0", "false", "no", "off") or not source_state(source_id)[0]:
+            return legacy
+    return entry["adapter"]
 
 
 def catalog() -> list[dict]:

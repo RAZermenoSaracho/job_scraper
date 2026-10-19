@@ -312,7 +312,7 @@ class TestBuildScrapers:
     def test_forwards_request_params_to_web3career_scraper(self, monkeypatch):
         captured_kwargs = {}
         monkeypatch.setitem(SOURCES["findweb3"], "adapter", self._spy_scraper_class({}))
-        monkeypatch.setitem(SOURCES["web3career"], "adapter", self._spy_scraper_class(captured_kwargs))
+        monkeypatch.setitem(SOURCES["web3career"], "legacy_adapter", self._spy_scraper_class(captured_kwargs))
 
         request = app_module.JobsRequest(**valid_body(
             keywords=["python"],
@@ -609,13 +609,20 @@ def make_row(url, title="Dev", company="Acme", location="Remote", tags=(), sourc
 
 
 class TestSourceCatalog:
-    def test_shape_and_default_sources(self, client):
+    def test_shape_and_default_sources(self, client, monkeypatch):
+        monkeypatch.delenv("WEB3CAREER_API_TOKEN", raising=False)
         body = client.get("/sources").json()
 
         assert body["schema_version"] == "1"
         by_id = {s["id"]: s for s in body["sources"]}
         assert SOURCE_ENTRY_KEYS <= set(by_id["findweb3"])
-        assert by_id["findweb3"]["executable"] is True and by_id["web3career"]["executable"] is True
+        assert by_id["findweb3"]["executable"] is True
+        # web3career is executable only with the API token configured.
+        assert by_id["web3career"]["executable"] is False and by_id["web3career"]["availability"] == "planned"
+        assert by_id["web3career"]["reason"] == "WEB3CAREER_API_TOKEN not set"
+        monkeypatch.setenv("WEB3CAREER_API_TOKEN", "x")
+        by_id = {s["id"]: s for s in client.get("/sources").json()["sources"]}
+        assert by_id["web3career"]["executable"] is True and by_id["web3career"]["availability"] == "available"
 
     def test_executable_is_computed_from_adapter_and_config(self, client, monkeypatch):
         base = {"label": "X", "category": "job_board", "availability": "available",
