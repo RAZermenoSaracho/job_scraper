@@ -14,15 +14,27 @@ durable state.
 
 ```
 .
-├── app.py                 # FastAPI app: POST /jobs schedules a background scrape; GET .../status and .../result poll it
+├── app.py                    # FastAPI: POST /jobs, GET /jobs/{id}/status|result, GET /sources; merge/rank/cut, errors, deadline, optional X-API-Key
+├── ecosystem.config.cjs      # pm2: job-scraper-api on 127.0.0.1:8420; loads WEB3CAREER_API_TOKEN from the token file at startup
 ├── utils/
-│   └── filters.py         # Per-candidate filter predicates (discarded URLs, location, anti-keywords, required experience)
-└── scrapers/
-    └── fw3_jobscraper.py  # Fw3Scraper class for findweb3.com — filters + ranks candidates internally, reports progress
+│   ├── filters.py            # term_hits (the one matching rule) + per-candidate predicates
+│   ├── normalize.py          # canonical_url, identify_url, dedupe_key, work mode, html_to_text, build_row (normalized row)
+│   └── http.py               # polite GET: User-Agent, 15 s timeout, 3 tries, backoff+jitter, Retry-After, secret redaction
+├── scrapers/
+│   ├── __init__.py           # SOURCES registry (single source of truth), adapter_for, catalog, source_state
+│   ├── base.py               # BaseScraper: shared kwargs, evaluate() filter chain, select() ranking, deadline
+│   ├── fw3_jobscraper.py     # findweb3.com (Selenium, hardened)
+│   ├── web3career_jobscraper.py  # web3.career legacy HTML scraper (frontend default path until API cut-over)
+│   ├── web3career_api.py     # web3.career official API (needs WEB3CAREER_API_TOKEN)
+│   ├── hashtagweb3_feed.py   # Hashtag Web3 JSON feed (one fetch per run, personal non-commercial use)
+│   └── ats_scraper.py        # Greenhouse / Lever / Ashby board APIs
+└── tests/                    # offline pytest; recorded fixtures in tests/fixtures/{ats,web3}
 ```
 
 There is no `keywords.json` and no scraping-related `.env` values — see [API](#api) below for
-where that config now lives (the request body).
+where that config lives (the request body). The only env vars are operational: `WEB3CAREER_API_TOKEN`
+(web3.career API), `WEB3CAREER_LEGACY_SCRAPER` (cut-over flag), `JOB_SCRAPER_API_KEY` (optional
+`X-API-Key` guard), `JOB_SCRAPER_CONTACT` (put in the User-Agent of the plain-HTTP adapters).
 
 ## Context
 
@@ -30,175 +42,136 @@ This project is part of a personal job search workflow (see sibling folder `job_
 
 ## utils/filters.py
 
-Exposes four per-candidate **predicate** functions, all no-ops (always pass) when their
-corresponding config is empty/`None`:
+Per-candidate **predicates**, all no-ops when their config is empty/`None`:
 
-1. **`passes_discarded_urls(url, discarded_urls)`** — operates on the raw candidate URL string
-   (a `set`), not a job dict. Fails if `url` is in `discarded_urls`. Scrapers check this during
-   **search** (link collection), not during the later per-candidate visit loop — a discarded URL
-   must never consume one of the `max_jobs_per_keyword` slots, otherwise the same discarded jobs
-   get "found" (and re-counted against the limit) on every run, crowding out undiscovered ones.
-2. **`passes_location(job, acceptable_locations)`** — passes if `Job Location` is empty/`None`
-   (unknown location isn't disqualifying), or contains (case-insensitive substring) any entry from
-   `acceptable_locations`.
-3. **`passes_anti_keywords(job, anti_keywords)`** — fails if `job_text(job)` contains any
-   `anti_keywords` entry (case-insensitive substring).
-4. **`passes_experience(job, max_experience_years)`** — extracts every "years of experience"
-   mention from `job_text(job)` via `EXPERIENCE_PATTERN` (a regex matching `"N+ years"`,
-   `"N-M years"`, and plain `"N years"` — the latter also covers `"at least N years"` /
-   `"minimum of N years"` since the number still immediately precedes "years"). For a range like
-   `"N-M years"`, only the minimum `N` is compared — a job requiring `"3-7 years"` passes if
-   `max_experience_years >= 3`, even though 4 doesn't reach 7. Fails only if *some* mention's
-   minimum exceeds `max_experience_years`. Jobs with no experience mention at all pass.
+- **`term_hits(job, terms, match_mode)`** — the ONE keyword/anti-keyword rule for every source,
+  on `job_text(job)` (title + tag-stripped description). `substring` (default) is the original
+  case-insensitive substring test; `word` normalizes with `norm_text` (accents, case, punctuation,
+  whitespace) and matches whole words/phrases only. Returns the unique terms hit (original casing);
+  empty terms are ignored. `Tags`/score = this list; `passes_anti_keywords` is `not term_hits(...)`.
+- **`passes_discarded_urls(url, set)`** — exact match on the raw URL; scrapers check it during
+  **search** so a discarded URL never consumes a `max_jobs_per_keyword` slot or costs a detail fetch.
+- **`url_is_known` / `row_is_known` / `expand_known_keys`** — `known_keys` (canonical URL,
+  `"<source>:<source_job_id>"` or `dedupe_key`): URL/id forms are checked at search time (skip before
+  fetch), `dedupe_key` after fetch.
+- **`passes_location`** (empty location passes), **`passes_experience`** (compares the minimum of
+  "N-M years"), **`passes_since`** (undated rows are kept), **`passes_work_mode`** (listed or
+  `unknown`), **`passes_seniority`** (whole word, *title only*, any `match_mode`),
+  **`passes_excluded_companies`** (`norm_text` equality, not substring).
 
-The last three take a job dict already in the output schema shape. `job_text(job)` (also exported)
-builds `Job Title` + plain-text `Job Description` (HTML tags stripped) — used by both these
-predicates and the scraper's relevance scoring, so filtering and scoring always look at the same
-text. `app.py` never imports this module; scrapers call these functions themselves, inline.
+`BaseScraper.evaluate()` (scrapers/base.py) runs them in this order: location → anti_keywords →
+experience → since → work_mode → seniority → excluded_companies → known dedupe_key, then keyword
+matching/score. Scrapers must not re-implement any of it. Seniority and work-mode are best-effort
+text heuristics.
 
-## scrapers/fw3_jobscraper.py
+## utils/normalize.py — the normalized row
 
-Exposes a single class `Fw3Scraper`. Key constraints specific to this site:
-- The site's URL scheme only supports one keyword per search: `https://findweb3.com/jobs/{keyword}`
-- Uses headless Selenium (no public API available)
-- Caps the number of postings explored per keyword via `max_jobs_per_keyword` (constructor param)
-- `Company Name` and `Job Description` are extracted from the job detail page via best-effort
-  XPath selectors (class/data-testid containing "company"/"description"); `Job Description` is
-  stored as raw HTML, unsanitized — no plain-text conversion is done in the scraper.
-- **Discards during search, not after.** `search_by_keyword` skips any link already in
-  `discarded_urls` as it scans the listing page's `<a>` tags, and keeps scanning further links
-  until it has `max_jobs_per_keyword` valid ones or the page's links run out — a discarded URL
-  never occupies one of those slots, so new postings can naturally replace discarded ones instead
-  of the same discarded jobs getting re-found (and re-counted against the limit) every run. This
-  costs no extra requests: the listing page is already fully loaded in the DOM, so "keep scanning"
-  just means not breaking the loop early.
-- **Filters inline, then ranks.** `run()` visits every candidate URL returned by search (each one
-  has already passed `passes_discarded_urls`). The candidate's fields are extracted and mapped to
-  the output schema, then run through `passes_location` → `passes_anti_keywords` →
-  `passes_experience`. Rejected candidates are dropped immediately. A candidate that survives all
-  three is scored (count of unique `keywords` matches in its `job_text`), and only *after every
-  candidate has been visited* is the surviving pool sorted by score (descending) and cut down to the best
-  `top_n_results`. This is deliberate: stopping early at the first `top_n_results` passing
-  candidates would return "first found," not "most relevant" — a later candidate with a much better
-  score wouldn't get a chance to bump out an earlier, weaker one. Drop counts per filter, plus the
-  min/max score among the final selection, are logged at the end of `run()`.
-- **Reports progress via an optional callback, not just logs.** The constructor accepts
-  `on_progress: Callable[[str, int, int], None] | None`. `run()` calls `self._report(stage,
-  current, total)` at the same three points it already calls `logger.info` with progress info
-  (once per keyword while searching, once per candidate while scraping, once at the end with the
-  final filtered/passed counts) — `_report` just invokes `on_progress` if one was given. The
-  scraper has zero knowledge of FastAPI, background tasks, or `jobs_status`; `app.py` supplies a
-  closure that writes into `jobs_status[job_id]`.
+Every scraper builds rows with `build_row(...)`: the legacy keys (`Job Title`, `Company Name`,
+`Job Description` (raw HTML), `Job Location`, `Compensation`, `Job Url`, `Tags` (csv), `Notes`)
+**unchanged**, plus `source`, `source_job_id`, `canonical_url`, `apply_url`, `company`, `title`,
+`location`, `work_mode` (`remote|hybrid|onsite|unknown`), `posted_at` (ISO UTC or null),
+`description_html`, `description_text`, `salary`, `ats_type`, `tags` (list), `dedupe_key`. Unknown
+values are `null` (never omitted). The result envelope is `{schema_version: "1", keywords, jobs,
+errors}`; consumers must ignore unknown fields. `canonical_url` is deterministic and idempotent
+(tracking params stripped; Greenhouse/Lever/Ashby/LinkedIn/Wellfound/web3.career/findweb3 forms,
+see `identify_url`). `source_job_id` is the source's id; sources without one fall back to
+`sha1(canonical_url)` (`id_fallback=True`).
 
-### Scraper interface contract
+## Scrapers
 
-Every scraper class must expose:
+All scrapers subclass `BaseScraper` (kwargs: `max_jobs_per_keyword`, `top_n_results`,
+`acceptable_locations`, `anti_keywords`, `discarded_urls`, `max_experience_years`, `on_progress`,
+`known_keys`, `since`, `work_modes`, `seniority_exclude`, `excluded_companies`, `match_mode`,
+`deadline`) and expose `run(keywords) -> list[row]`. Non-fatal problems go in `self.errors`
+(`{source, error}`); `self.deadline_hit` marks a deadline stop. Each scraper ranks its own pool
+(score desc, stable) and cuts to `top_n_results`; `app.py` merges and applies the global cap.
 
-```python
-class SomeScraper:
-    def __init__(self, max_jobs_per_keyword: int, top_n_results: int) -> None: ...
-    def run(self, keywords: list) -> list: ...
-    # run() returns a clean list of job dicts matching the output schema below —
-    # no file I/O, no _ fields
-```
+- **findweb3** (`fw3_jobscraper.py`) — headless Selenium (no public API; `findweb3.com/api/` is
+  robots-disallowed and never called). No anti-detection options; chromedriver from PATH, else
+  Selenium Manager. Resilient selectors (class substrings, structural XPath, JSON-LD) degrade to
+  `null` + a logged warning; page loads retry with backoff and treat a 429 page as a failure.
+  One keyword per search URL `https://findweb3.com/jobs/{keyword}`.
+- **web3career** — official API (`web3career_api.py`): `GET https://web3.career/api/v1` with the
+  token (query param, always redacted), `limit` ≤ 100, **no paging** (docs + live check), one
+  request per keyword/tag, `apply_url` passed through byte-for-byte. Legacy HTML scraper
+  (`web3career_jobscraper.py`, `requests` + JSON-LD) stays the default when `sources` is omitted
+  until `WEB3CAREER_LEGACY_SCRAPER=0` and the token is set (cut-over), then the API adapter serves
+  the default path too. Removing the legacy scraper is deferred until the cut-over is verified.
+- **hashtagweb3** (`hashtagweb3_feed.py`) — one GET of the public JSON feed per run (cached by
+  ETag/Last-Modified), personal non-commercial use only, client-side filtering; `link` usually is an
+  ATS URL so `canonical_url` converges with ATS rows. No descriptions (title-only matching).
+- **greenhouse / lever / ashby** (`ats_scraper.py`) — public board JSON APIs via `utils/http.py`; one
+  GET per board, sequential with a 1 s gap, per-board failures in `errors[]`. Kept only if at least
+  one keyword hits.
+- Catalog-only (never fetched): `linkedin`, `wellfound`, `bitcoinerjobs`, `laborx` (manual — paste
+  the URL into Odoo) and `cyfrin` (defunct). LinkedIn: no adapter, no browser extraction, ever.
 
-`Fw3Scraper` additionally accepts `acceptable_locations`, `anti_keywords`, `discarded_urls`,
-`max_experience_years`, and `on_progress` kwargs (all optional, default to "no filtering" / "no
-progress reporting") so it can apply `utils/filters.py` inline, rank by relevance, and report
-progress. Any future scraper that wants the same support should accept the same kwargs and apply
-the same predicates + ranking + progress calls during its own search loop — this isn't (yet)
-enforced as part of the strict interface contract above, since not every scraper will need it.
+### Source registry and `GET /sources`
 
-`app.py` is solely responsible for validating the request body and shaping the HTTP response. It
-does not filter, score, or otherwise inspect job contents, and it reads no config file or env var
-for scraping parameters — scrapers are the only place that filtering/scoring happens, and the
-request body is the only source of scraping config.
+`SOURCES` in `scrapers/__init__.py` is plain data (adapter class or `None`, label, category,
+availability, needs_browser, requires_config, filters, hosts, ingestion). `executable` is
+**computed** (`source_state`): adapter registered AND `requires_config` satisfied (e.g.
+`token:WEB3CAREER_API_TOKEN` set); unmet config shows availability `planned` with a `reason`.
+`GET /sources` returns `{schema_version, sources: [{id, name, category, availability, executable,
+requires_config, filters, hosts, ingestion, reason}]}` with no network I/O. `sources` in a request
+is validated against it (unknown or non-executable ids → 422 naming them).
 
 ### Adding a new scraper
 
-1. Create `scrapers/{site}_jobscraper.py` following the interface above.
-2. Instantiate the class in `app.py`'s `_build_scrapers()` function.
-3. No changes to `create_job()` / `_run_scrape_job()`'s orchestration loop needed.
-
-**Multi-scraper top-N note:** each scraper applies its own `top_n_results` cut internally (on its
-own filtered-and-ranked pool). `app.py` concatenates all results as-is. If a global re-rank across
-sites is ever needed, sort the combined list by a shared score field in `app.py` before returning
-the response.
+1. Subclass `BaseScraper` in `scrapers/{site}.py`; build rows with `build_row`; call
+   `self.skip_url(url)` during search, `self.evaluate(row, keywords, drops)` per candidate,
+   `self.select(...)` at the end; honour `self.expired()`.
+2. Register it in `SOURCES` (`scrapers/__init__.py`). `_build_scrapers` in `app.py` picks it up.
+3. Add fixtures under `tests/fixtures/` and offline tests.
 
 ## API
 
-Run locally:
+Run locally (the pm2 service `job-scraper-api` listens on **127.0.0.1:8420**):
 
 ```bash
 conda activate job_scraper
-uvicorn app:app --reload
+uvicorn app:app --reload --port 8420
 ```
 
-CORS is wide open (`ALLOWED_ORIGINS = ["*"]` in `app.py`, applied once via `CORSMiddleware` for the
-whole app — covers all three routes below) for development. **Restrict this to the real frontend's
-production domain(s) before deploying either service.**
+CORS is wide open (`ALLOWED_ORIGINS = ["*"]` in `app.py`). **Restrict this to the real frontend's
+production domain(s) before deploying.** If env `JOB_SCRAPER_API_KEY` is set, every route requires
+a matching `X-API-Key` header (constant-time compare, 401 otherwise); unset = disabled (default).
 
-Scraping is async: `POST /jobs` schedules the work and returns a `job_id`; the caller polls
-`GET /jobs/{job_id}/status` and then fetches `GET /jobs/{job_id}/result`. This exists because a
-full scrape (one page load per keyword, plus one per candidate) can take 2-4 minutes — long enough
-to exceed some edge/tunnel proxy timeouts (e.g. Cloudflare Tunnel) if done synchronously in one
-request/response cycle.
+Scraping is async: `POST /jobs` schedules the work and returns a `job_id`; poll
+`GET /jobs/{job_id}/status`, then fetch `GET /jobs/{job_id}/result`.
 
 ### `POST /jobs` — schedule a scrape
 
-Request body — validated by the `JobsRequest` Pydantic model in `app.py`. **This fully replaces
-`keywords.json` and the scraping env vars** — there is no server-side fallback for any of these:
-
-```json
-{
-  "keywords": ["python", "solidity", "..."],
-  "acceptable_locations": ["remote", "mexico", "..."],
-  "anti_keywords": ["senior staff", "..."],
-  "discarded_urls": ["https://findweb3.com/job/rec123", "..."],
-  "max_jobs_searched_per_keyword": 20,
-  "max_jobs_saved": 10,
-  "max_experience_years": 4
-}
-```
-
-| Field | Required? | Default |
+| Field | Type | Default |
 |---|---|---|
-| `keywords` | yes | — |
-| `acceptable_locations` | yes | — |
-| `anti_keywords` | no | `[]` |
-| `discarded_urls` | no | `[]` |
-| `max_jobs_searched_per_keyword` | yes | — |
-| `max_jobs_saved` | yes | — |
-| `max_experience_years` | yes | — |
+| `keywords` | list[str] | required |
+| `max_jobs_searched_per_keyword` | int | required |
+| `max_jobs_saved` | int (global cap) | required |
+| `acceptable_locations` | list[str] | `[]` |
+| `anti_keywords` | list[str] | `[]` |
+| `max_experience_years` | int or null | `null` |
+| `discarded_urls` | list[str] | `[]` |
+| `sources` | list[str] or null | `null` = findweb3 + web3career (legacy path) |
+| `boards` | list of `"<greenhouse|lever|ashby>:<token>"` | `[]` (no ATS runs); malformed → 422 |
+| `known_keys` | list[str] | `[]` |
+| `since` | ISO 8601 or null | `null` |
+| `work_modes` | subset of remote/hybrid/onsite | `[]` |
+| `seniority_exclude` | list[str] | `[]` |
+| `excluded_companies` | list[str] | `[]` |
+| `match_mode` | `"substring"` or `"word"` | `"substring"` |
+| `deadline_seconds` | number > 0 or null | `null` |
 
-`discarded_urls` — job URLs (as previously returned in a job's `Job Url` field) to exclude from
-this run. Filtered during search itself (see `passes_discarded_urls` above), not just before
-re-scraping a candidate's detail page — so a discarded URL never occupies one of the
-`max_jobs_searched_per_keyword` slots, and a client re-requesting after discarding some results
-gets that many slots backfilled with newly-discoverable postings instead of just a smaller result.
+Unknown fields are ignored. The frontend (`job_scraper_frontend`) sends only the seven legacy fields
+and must keep working unchanged (compat tests in `tests/test_app.py::TestFrontendCompatibility`).
+`boards` run per vendor and only when `sources` is omitted or lists the vendor id.
 
-A malformed body (missing a required field, wrong type) never reaches the handler — FastAPI/Pydantic
-reject it with `422` automatically before `create_job()` runs. Otherwise, this endpoint always
-succeeds with `202 {"job_id": "<uuid4>"}` — a scraper failure surfaces later, via polling, not here.
-
-`create_job()`:
-1. Calls `_purge_old_jobs()` (drops any `jobs_status` entries older than `JOB_STATUS_TTL_SECONDS`,
-   currently 1 hour — the only "cleanup" mechanism, no scheduler).
-2. Generates `job_id = str(uuid.uuid4())` and seeds `jobs_status[job_id]` with
-   `{"status": "running", "stage": "starting", "current": 0, "total": 0, "result": None, "error":
-   None, "created_at": time.time()}`.
-3. Schedules `_run_scrape_job(job_id, request)` via `BackgroundTasks.add_task(...)`. `_run_scrape_job`
-   is a plain sync function; Starlette runs sync background callables through its threadpool (not
-   the event loop), so the Selenium calls inside it don't block other requests.
-4. Returns `{"job_id": job_id}` immediately.
-
-`_run_scrape_job` builds a closure `on_progress(stage, current, total)` that does
-`jobs_status[job_id].update(stage=stage, current=current, total=total)`, passes it into
-`_build_scrapers(request, on_progress)`, runs each scraper, and on completion sets
-`jobs_status[job_id]` to `status="done"`, `stage="done"`, and
-`result={"keywords": ..., "jobs": ...}`. If building scrapers or any scraper's `run()` raises, it
-sets `status="error"` and `error="<message>"` instead, and returns without running further
-scrapers.
+Malformed bodies get `422`; otherwise `202 {"job_id": "<uuid4>"}` — failures surface via polling.
+`_run_scrape_job` runs each source in its own try/except: a failing source goes to `errors[]`
+(`{source, error}`, short, no stack) and the run continues; status is `error` only if **every**
+source failed. After all sources finish, rows are merged, de-duplicated by `canonical_url` /
+`dedupe_key` (higher score wins), ranked by score and cut to `max_jobs_saved` globally. With
+`deadline_seconds`, sources not started in time or interrupted get `errors[]` "deadline exceeded"
+and the run still finishes `done` with partial results.
 
 ### `GET /jobs/{job_id}/status` — poll progress
 
@@ -206,42 +179,13 @@ scrapers.
 {"status": "running", "stage": "scraping", "current": 7, "total": 20}
 ```
 
-- `status`: `running` | `done` | `error`.
-- `stage`: `starting` → `searching_keywords` → `scraping` → `filtering` → `done` (or `error`).
-- `current`/`total`: stage-relative counters, as reported by the scraper's `on_progress` callback.
-- If `status == "error"`, the body also includes `"error": "<message>"`.
-- `404` if `job_id` isn't in `jobs_status` (never existed, or already purged).
+`status`: `running` | `done` | `error` (with `"error"` message). `stage`: `starting` →
+`searching_keywords` → `scraping` → `filtering` → `done`. `404` if unknown/purged.
 
 ### `GET /jobs/{job_id}/result` — fetch the finished output
 
-Returns the same shape previously written to the output JSON file, once `status == "done"`:
-
-```json
-{
-  "keywords": ["python", "defi", "..."],
-  "jobs": [
-    {
-      "Job Title": "DeFi Algorithmic Trading Internship",
-      "Company Name": "Wintermute",
-      "Job Description": "<div>...</div>",
-      "Job Location": "Fully Remote",
-      "Compensation": null,
-      "Job Url": "https://findweb3.com/job/recoUnkn8Eb9kNPcK",
-      "Tags": "python, defi, quantitative",
-      "Notes": ""
-    }
-  ]
-}
-```
-
-Field notes:
-- `Job Description` is the raw HTML extracted from the site — not sanitized or converted to plain text.
-- `Tags` is a comma-separated string of the request's `keywords` that matched this specific posting.
-- `Notes` is always `""` — reserved for manual fill-in downstream.
-- `Job Url` points to the listing on the source site (e.g. findweb3.com), not an external application link.
-
-Errors: `404` if `job_id` is unknown; `409` if `status == "running"` (with a message saying so);
-`500` with the stored error message if `status == "error"`.
+`{"schema_version": "1", "keywords": [...], "jobs": [<normalized row>...], "errors": [...]}` once
+`done`. `404` unknown, `409` still running, `500` with the stored message if `status == "error"`.
 
 ## Environment
 
@@ -266,6 +210,7 @@ pip install -r requirements.txt
 
 ## Conventions
 
-- Each new site-specific scraper lives in `scrapers/` (e.g. future additions like `otta_jobscraper.py`, `cryptojobs_jobscraper.py`) and should follow the same output schema so results from multiple sources stay compatible.
+- Each new site-specific scraper lives in `scrapers/`, is registered in `SOURCES`, and emits the normalized row so results from multiple sources stay compatible.
+- Never scrape sources whose terms prohibit automation (LinkedIn, Wellfound, Bitcoiner Jobs, LaborX); never bypass anti-bot measures. Never log or commit the web3.career token.
 - Site-specific quirks (URL schemes, headless browser needs, rate limiting) are handled inside each scraper module — `app.py` should stay a thin request handler that doesn't need to know about per-site scraping details.
 - Be respectful of target sites: check `robots.txt`, add delays between requests, and avoid hammering job detail pages.
