@@ -17,12 +17,14 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from datetime import datetime
+from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from scrapers import Fw3Scraper, Web3CareerScraper
+from scrapers import DEFAULT_SOURCES, SOURCES, catalog, source_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,12 +68,20 @@ class JobsRequest(BaseModel):
     """POST /jobs body. Fully describes a scraping run — nothing is read from disk or env."""
 
     keywords: list[str]
-    acceptable_locations: list[str]
+    acceptable_locations: list[str] = []
     anti_keywords: list[str] = []
     discarded_urls: list[str] = []
     max_jobs_searched_per_keyword: int
     max_jobs_saved: int
-    max_experience_years: int
+    max_experience_years: int | None = None
+    sources: list[str] | None = None  # None = DEFAULT_SOURCES (findweb3 + web3career)
+    known_keys: list[str] = []
+    since: datetime | None = None
+    work_modes: list[Literal["remote", "hybrid", "onsite"]] = []
+    seniority_exclude: list[str] = []
+    excluded_companies: list[str] = []
+    deadline_seconds: float | None = Field(default=None, gt=0)
+    match_mode: Literal["substring", "word"] = "substring"
 
 
 def _purge_old_jobs() -> None:
@@ -87,31 +97,57 @@ def _build_scrapers(
     on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list:
     """
-    Return [(display_name, scraper_instance), ...] for this request. Built entirely
-    from the request body — there is no config file or env var fallback for scraping
-    parameters. on_progress, if given, is wired into every scraper that supports it.
+    Return [(source_id, scraper_instance), ...] for this request, iterating the registry
+    in scrapers/__init__.py. Built entirely from the request body — there is no config
+    file or env var fallback for scraping parameters.
     """
-    return [
-        ("findweb3.com", Fw3Scraper(
-            max_jobs_per_keyword=request.max_jobs_searched_per_keyword,
-            top_n_results=request.max_jobs_saved,
-            acceptable_locations=request.acceptable_locations,
-            anti_keywords=request.anti_keywords,
-            discarded_urls=request.discarded_urls,
-            max_experience_years=request.max_experience_years,
-            on_progress=on_progress,
-        )),
-        ("web3.career", Web3CareerScraper(
-            max_jobs_per_keyword=request.max_jobs_searched_per_keyword,
-            top_n_results=request.max_jobs_saved,
-            acceptable_locations=request.acceptable_locations,
-            anti_keywords=request.anti_keywords,
-            discarded_urls=request.discarded_urls,
-            max_experience_years=request.max_experience_years,
-            on_progress=on_progress,
-        )),
-        # ("otta.com", OttaScraper(...)),
-    ]
+    source_ids = DEFAULT_SOURCES if request.sources is None else list(dict.fromkeys(request.sources))
+    kwargs = dict(
+        max_jobs_per_keyword=request.max_jobs_searched_per_keyword,
+        top_n_results=request.max_jobs_saved,
+        acceptable_locations=request.acceptable_locations,
+        anti_keywords=request.anti_keywords,
+        discarded_urls=request.discarded_urls,
+        max_experience_years=request.max_experience_years,
+        on_progress=on_progress,
+        known_keys=request.known_keys,
+        since=request.since,
+        work_modes=request.work_modes,
+        seniority_exclude=request.seniority_exclude,
+        excluded_companies=request.excluded_companies,
+        match_mode=request.match_mode,
+    )
+    return [(sid, SOURCES[sid]["adapter"](**kwargs)) for sid in source_ids]
+
+
+def _score(job: dict) -> int:
+    """Relevance score = unique keywords matched (Tags)."""
+    tags = job.get("tags")
+    if tags is None:
+        tags = [t for t in (job.get("Tags") or "").split(",") if t.strip()]
+    return len(tags)
+
+
+def _merge_and_cut(jobs: list, cap: int) -> list:
+    """
+    Merge rows from all sources: drop duplicates by canonical_url / dedupe_key (higher
+    score wins, keeping first position), rank by score desc (stable on source order)
+    and cut to `cap`.
+    """
+    kept: list = []
+    index: dict = {}
+    for job in jobs:
+        dedupe = job.get("dedupe_key") or ""
+        keys = [k for k in (job.get("canonical_url"), dedupe if dedupe.strip("|") else None) if k]
+        pos = next((index[k] for k in keys if k in index), None)
+        if pos is None:
+            pos = len(kept)
+            kept.append(job)
+        elif _score(job) > _score(kept[pos]):
+            kept[pos] = job
+        for k in keys:
+            index[k] = pos
+    return sorted(kept, key=_score, reverse=True)[:cap]
 
 
 def _run_scrape_job(job_id: str, request: JobsRequest) -> None:
@@ -131,17 +167,31 @@ def _run_scrape_job(job_id: str, request: JobsRequest) -> None:
         jobs_status[job_id].update(status="error", error=f"Failed to configure scrapers: {exc}")
         return
 
+    deadline = time.monotonic() + request.deadline_seconds if request.deadline_seconds else None
     all_jobs: list = []
     errors: list = []
+    failed = 0
     for site_name, scraper in scrapers:
+        if deadline is not None:
+            if time.monotonic() >= deadline:
+                errors.append({"source": site_name, "error": "deadline exceeded"})
+                continue
+            scraper.deadline = deadline
         try:
             all_jobs.extend(scraper.run(request.keywords))
         except Exception as exc:
             log.exception("Scraper '%s' failed for job %s", site_name, job_id)
-            errors.append({"source": site_name, "error": _short_error(exc)})
+            failed += 1
+            # A scraper that tracks its own per-board failures reports those instead.
+            errors.extend(getattr(scraper, "errors", None) or
+                          [{"source": site_name, "error": _short_error(exc)}])
+            continue
+        errors.extend(getattr(scraper, "errors", None) or [])
+        if getattr(scraper, "deadline_hit", False):
+            errors.append({"source": site_name, "error": "deadline exceeded"})
 
     # Error only if every source failed (then the old frontend behaviour: show the error).
-    if scrapers and len(errors) == len(scrapers):
+    if scrapers and failed == len(scrapers):
         message = "; ".join(f"Scraper '{e['source']}' failed: {e['error']}" for e in errors)
         jobs_status[job_id].update(status="error", error=message)
         return
@@ -152,7 +202,7 @@ def _run_scrape_job(job_id: str, request: JobsRequest) -> None:
         result={
             "schema_version": SCHEMA_VERSION,
             "keywords": request.keywords,
-            "jobs": all_jobs,
+            "jobs": _merge_and_cut(all_jobs, request.max_jobs_saved),
             "errors": errors,
         },
     )
@@ -170,6 +220,26 @@ def _get_job_or_404(job_id: str) -> dict:
     return state
 
 
+def _validate_sources(sources: list | None) -> None:
+    """422 naming every unknown or non-executable source id; never silently ignored."""
+    problems = []
+    for sid in dict.fromkeys(sources or []):
+        if sid not in SOURCES:
+            problems.append(f"unknown source '{sid}'")
+        else:
+            executable, reason, _ = source_state(sid)
+            if not executable:
+                problems.append(f"source '{sid}' is not executable ({reason})")
+    if problems:
+        raise HTTPException(status_code=422, detail="; ".join(problems))
+
+
+@app.get("/sources")
+def get_sources() -> dict:
+    """Static source catalog (no network I/O, no adapter instantiation)."""
+    return {"schema_version": SCHEMA_VERSION, "sources": catalog()}
+
+
 @app.post("/jobs", status_code=202)
 def create_job(request: JobsRequest, background_tasks: BackgroundTasks) -> dict:
     """
@@ -177,6 +247,7 @@ def create_job(request: JobsRequest, background_tasks: BackgroundTasks) -> dict:
     task. Returns {"job_id": ...} immediately — the caller polls
     GET /jobs/{job_id}/status and GET /jobs/{job_id}/result for progress/output.
     """
+    _validate_sources(request.sources)
     _purge_old_jobs()
 
     job_id = str(uuid.uuid4())

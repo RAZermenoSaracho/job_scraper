@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+from scrapers import SOURCES
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +88,7 @@ class TestCreateJob:
 
     @pytest.mark.parametrize(
         "missing_field",
-        ["keywords", "acceptable_locations", "max_jobs_searched_per_keyword", "max_jobs_saved", "max_experience_years"],
+        ["keywords", "max_jobs_searched_per_keyword", "max_jobs_saved"],
     )
     def test_missing_required_field_returns_422(self, client, missing_field):
         body = valid_body()
@@ -280,8 +281,8 @@ class TestBuildScrapers:
 
     def test_forwards_request_params_to_fw3_scraper(self, monkeypatch):
         captured_kwargs = {}
-        monkeypatch.setattr(app_module, "Fw3Scraper", self._spy_scraper_class(captured_kwargs))
-        monkeypatch.setattr(app_module, "Web3CareerScraper", self._spy_scraper_class({}))
+        monkeypatch.setitem(SOURCES["findweb3"], "adapter", self._spy_scraper_class(captured_kwargs))
+        monkeypatch.setitem(SOURCES["web3career"], "adapter", self._spy_scraper_class({}))
 
         request = app_module.JobsRequest(**valid_body(
             keywords=["python"],
@@ -299,7 +300,7 @@ class TestBuildScrapers:
         scrapers = app_module._build_scrapers(request, progress_cb)
 
         names = [name for name, _instance in scrapers]
-        assert "findweb3.com" in names
+        assert "findweb3" in names
         assert captured_kwargs["max_jobs_per_keyword"] == 15
         assert captured_kwargs["top_n_results"] == 7
         assert captured_kwargs["acceptable_locations"] == ["remote"]
@@ -310,8 +311,8 @@ class TestBuildScrapers:
 
     def test_forwards_request_params_to_web3career_scraper(self, monkeypatch):
         captured_kwargs = {}
-        monkeypatch.setattr(app_module, "Fw3Scraper", self._spy_scraper_class({}))
-        monkeypatch.setattr(app_module, "Web3CareerScraper", self._spy_scraper_class(captured_kwargs))
+        monkeypatch.setitem(SOURCES["findweb3"], "adapter", self._spy_scraper_class({}))
+        monkeypatch.setitem(SOURCES["web3career"], "adapter", self._spy_scraper_class(captured_kwargs))
 
         request = app_module.JobsRequest(**valid_body(
             keywords=["python"],
@@ -329,7 +330,7 @@ class TestBuildScrapers:
         scrapers = app_module._build_scrapers(request, progress_cb)
 
         names = [name for name, _instance in scrapers]
-        assert "web3.career" in names
+        assert "web3career" in names
         assert captured_kwargs["max_jobs_per_keyword"] == 15
         assert captured_kwargs["top_n_results"] == 7
         assert captured_kwargs["acceptable_locations"] == ["remote"]
@@ -339,15 +340,15 @@ class TestBuildScrapers:
         assert captured_kwargs["on_progress"] is progress_cb
 
     def test_returns_both_scrapers(self, monkeypatch):
-        monkeypatch.setattr(app_module, "Fw3Scraper", self._spy_scraper_class({}))
-        monkeypatch.setattr(app_module, "Web3CareerScraper", self._spy_scraper_class({}))
+        monkeypatch.setitem(SOURCES["findweb3"], "adapter", self._spy_scraper_class({}))
+        monkeypatch.setitem(SOURCES["web3career"], "adapter", self._spy_scraper_class({}))
 
         request = app_module.JobsRequest(**valid_body())
 
         scrapers = app_module._build_scrapers(request)
 
         names = {name for name, _instance in scrapers}
-        assert names == {"findweb3.com", "web3.career"}
+        assert names == {"findweb3", "web3career"}
 
 
 # ── _run_scrape_job / multi-scraper orchestration ───────────────────────────
@@ -589,3 +590,220 @@ class TestFrontendCompatibility:
         assert status["status"] == "error" and "boom" in status["error"]
         result = client.get(f"/jobs/{job_id}/result")
         assert result.status_code == 500 and "boom" in result.json()["detail"]
+
+
+# ── improve-discovery-filters: request fields, catalog, ranking, deadline ───
+
+from utils.normalize import build_row  # noqa: E402
+
+SOURCE_ENTRY_KEYS = {"id", "name", "category", "availability", "executable", "requires_config",
+                     "filters", "hosts", "ingestion"}
+
+
+def make_row(url, title="Dev", company="Acme", location="Remote", tags=(), source="findweb3"):
+    return build_row(
+        {"Job Title": title, "Company Name": company, "Job Description": "<p>d</p>",
+         "Job Location": location, "Compensation": None, "Job Url": url},
+        source, tags=list(tags), source_job_id=url.rsplit("/", 1)[-1],
+    )
+
+
+class TestSourceCatalog:
+    def test_shape_and_default_sources(self, client):
+        body = client.get("/sources").json()
+
+        assert body["schema_version"] == "1"
+        by_id = {s["id"]: s for s in body["sources"]}
+        assert SOURCE_ENTRY_KEYS <= set(by_id["findweb3"])
+        assert by_id["findweb3"]["executable"] is True and by_id["web3career"]["executable"] is True
+
+    def test_executable_is_computed_from_adapter_and_config(self, client, monkeypatch):
+        base = {"label": "X", "category": "job_board", "availability": "available",
+                "needs_browser": False, "filters": [], "hosts": [], "ingestion": None}
+        monkeypatch.setitem(SOURCES, "tok", {**base, "adapter": object, "requires_config": "token:TEST_TOK"})
+        monkeypatch.setitem(SOURCES, "manual", {**base, "adapter": None, "availability": "manual",
+                                                "requires_config": None, "ingestion": "paste URL"})
+        monkeypatch.delenv("TEST_TOK", raising=False)
+
+        by_id = {s["id"]: s for s in client.get("/sources").json()["sources"]}
+        assert by_id["tok"]["executable"] is False and by_id["tok"]["availability"] == "planned"
+        assert by_id["manual"]["executable"] is False and by_id["manual"]["ingestion"] == "paste URL"
+
+        monkeypatch.setenv("TEST_TOK", "x")
+        by_id = {s["id"]: s for s in client.get("/sources").json()["sources"]}
+        assert by_id["tok"]["executable"] is True and by_id["tok"]["availability"] == "available"
+
+    def test_no_network_needed(self, client, monkeypatch):
+        import socket
+
+        def boom(*a, **k):
+            raise AssertionError("network access")
+
+        monkeypatch.setattr(socket, "create_connection", boom)
+        monkeypatch.setattr(socket.socket, "connect", boom)
+        assert client.get("/sources").status_code == 200
+
+
+class TestSourcesValidation:
+    def _catalog_only(self, monkeypatch):
+        monkeypatch.setitem(SOURCES, "linkedin", {
+            "adapter": None, "label": "LinkedIn", "category": "job_board", "availability": "manual",
+            "needs_browser": False, "requires_config": None, "filters": [], "hosts": [],
+            "ingestion": "paste URL into Odoo"})
+
+    def test_unknown_source_422_names_it_and_no_job_starts(self, client):
+        response = client.post("/jobs", json=valid_body(sources=["foo"]))
+        assert response.status_code == 422 and "foo" in response.json()["detail"]
+        assert app_module.jobs_status == {}
+
+    def test_non_executable_source_422(self, client, monkeypatch):
+        self._catalog_only(monkeypatch)
+        response = client.post("/jobs", json=valid_body(sources=["findweb3", "linkedin"]))
+        assert response.status_code == 422 and "linkedin" in response.json()["detail"]
+        assert app_module.jobs_status == {}
+
+    def test_source_selection_builds_only_requested(self, monkeypatch):
+        built = []
+
+        class Spy:
+            def __init__(self, **kw): built.append(self)
+
+        monkeypatch.setitem(SOURCES, "findweb3", {**SOURCES["findweb3"], "adapter": Spy})
+        monkeypatch.setitem(SOURCES, "web3career", {**SOURCES["web3career"], "adapter": Spy})
+
+        request = app_module.JobsRequest(**valid_body(sources=["web3career"]))
+        assert [n for n, _ in app_module._build_scrapers(request)] == ["web3career"]
+
+        built.clear()
+        request = app_module.JobsRequest(**valid_body())  # sources omitted -> legacy default
+        assert [n for n, _ in app_module._build_scrapers(request)] == ["findweb3", "web3career"]
+
+    def test_all_new_fields_forwarded_to_scrapers(self, monkeypatch):
+        captured = {}
+
+        class Spy:
+            def __init__(self, **kw): captured.update(kw)
+
+        monkeypatch.setitem(SOURCES, "findweb3", {**SOURCES["findweb3"], "adapter": Spy})
+        request = app_module.JobsRequest(**valid_body(
+            sources=["findweb3"], known_keys=["a"], since="2026-10-01T00:00:00Z", work_modes=["remote"],
+            seniority_exclude=["senior"], excluded_companies=["x"], match_mode="word"))
+        app_module._build_scrapers(request)
+
+        assert captured["known_keys"] == ["a"] and captured["work_modes"] == ["remote"]
+        assert captured["seniority_exclude"] == ["senior"] and captured["excluded_companies"] == ["x"]
+        assert captured["match_mode"] == "word" and captured["since"].year == 2026
+
+
+class TestOptionalRequestFields:
+    def test_legacy_body_gets_neutral_defaults(self):
+        request = app_module.JobsRequest(**valid_body())
+        assert (request.sources, request.known_keys, request.since, request.work_modes) == (None, [], None, [])
+        assert (request.seniority_exclude, request.excluded_companies) == ([], [])
+        assert (request.deadline_seconds, request.match_mode) == (None, "substring")
+
+    def test_acceptable_locations_and_experience_now_optional(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: [])
+        body = valid_body()
+        del body["acceptable_locations"], body["max_experience_years"]
+        response = client.post("/jobs", json=body)
+        assert response.status_code == 202
+        request = app_module.JobsRequest(**body)
+        assert request.acceptable_locations == [] and request.max_experience_years is None
+
+    @pytest.mark.parametrize("override", [
+        {"match_mode": "fuzzy"}, {"work_modes": ["mars"]}, {"since": "not-a-date"}, {"deadline_seconds": 0},
+    ])
+    def test_invalid_new_values_422(self, client, override):
+        assert client.post("/jobs", json=valid_body(**override)).status_code == 422
+
+    def test_unknown_fields_still_ignored(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: [])
+        assert client.post("/jobs", json=valid_body(whatever=1)).status_code == 202
+
+
+class TestGlobalRanking:
+    def _run(self, monkeypatch, sources, **overrides):
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: sources)
+        app_module.jobs_status["j"] = {"status": "running", "stage": "starting", "current": 0,
+                                       "total": 0, "result": None, "error": None, "created_at": time.time()}
+        app_module._run_scrape_job("j", app_module.JobsRequest(**valid_body(**overrides)))
+        return app_module.jobs_status["j"]
+
+    def test_cross_source_best_first_and_global_cut(self, monkeypatch):
+        s1 = [make_row("https://x.com/a/1", "A", tags="abc"), make_row("https://x.com/a/2", "B", tags="a")]
+        s2 = [make_row("https://x.com/b/1", "C", tags="abcde"), make_row("https://x.com/b/2", "D", tags="ab")]
+        state = self._run(monkeypatch, [("s1", FakeScraper(jobs=s1)), ("s2", FakeScraper(jobs=s2))],
+                          max_jobs_saved=3)
+
+        assert [j["title"] for j in state["result"]["jobs"]] == ["C", "A", "D"]
+
+    def test_never_exceeds_max_jobs_saved_discard_queue_style(self, monkeypatch):
+        rows = [make_row(f"https://x.com/{i}", f"T{i}") for i in range(4)]
+        state = self._run(monkeypatch, [("s1", FakeScraper(jobs=rows)), ("s2", FakeScraper(jobs=rows[:2]))],
+                          max_jobs_saved=1)
+        assert len(state["result"]["jobs"]) == 1
+
+    def test_duplicate_across_sources_keeps_higher_score(self, monkeypatch):
+        low = make_row("https://x.com/1", "Same", tags="a")
+        high = make_row("https://y.com/9", "Same", tags="abc", source="lever")  # same dedupe_key, other URL
+        state = self._run(monkeypatch, [("s1", FakeScraper(jobs=[low])), ("s2", FakeScraper(jobs=[high]))])
+        assert state["result"]["jobs"] == [high]
+
+    def test_same_canonical_url_deduped(self, monkeypatch):
+        a = make_row("https://x.com/1", "One", company="A")
+        b = make_row("https://x.com/1?utm_source=z", "Other", company="B", tags="q")
+        state = self._run(monkeypatch, [("s1", FakeScraper(jobs=[a])), ("s2", FakeScraper(jobs=[b]))])
+        assert len(state["result"]["jobs"]) == 1
+
+    def test_single_source_equals_input_order_for_equal_scores(self, monkeypatch):
+        rows = [make_row(f"https://x.com/{i}", f"T{i}", company=f"C{i}") for i in range(3)]
+        state = self._run(monkeypatch, [("s1", FakeScraper(jobs=rows))])
+        assert state["result"]["jobs"] == rows
+
+
+class TestDeadline:
+    def test_interrupted_source_noted_and_status_done(self, monkeypatch):
+        class Interrupted:
+            deadline_hit = True
+            errors = []
+
+            def run(self, keywords):
+                return [make_row("https://x.com/1")]
+
+        monkeypatch.setattr(
+            app_module, "_build_scrapers",
+            lambda request, on_progress=None: [("first", FakeScraper(jobs=[make_row("https://x.com/0", "Z")])),
+                                              ("second", Interrupted())],
+        )
+        app_module.jobs_status["j"] = {"status": "running", "stage": "s", "current": 0, "total": 0,
+                                       "result": None, "error": None, "created_at": time.time()}
+        app_module._run_scrape_job("j", app_module.JobsRequest(**valid_body(deadline_seconds=60)))
+
+        state = app_module.jobs_status["j"]
+        assert state["status"] == "done" and len(state["result"]["jobs"]) == 2
+        assert state["result"]["errors"] == [{"source": "second", "error": "deadline exceeded"}]
+
+    def test_sources_not_started_after_deadline_are_reported(self, monkeypatch):
+        clock = iter([0.0, 0.0, 100.0, 100.0, 100.0])
+        monkeypatch.setattr(app_module.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(
+            app_module, "_build_scrapers",
+            lambda request, on_progress=None: [("first", FakeScraper(jobs=[make_row("https://x.com/0")])),
+                                              ("second", FakeScraper(jobs=[make_row("https://x.com/1", "Q")]))],
+        )
+        app_module.jobs_status["j"] = {"status": "running", "stage": "s", "current": 0, "total": 0,
+                                       "result": None, "error": None, "created_at": time.time()}
+        app_module._run_scrape_job("j", app_module.JobsRequest(**valid_body(deadline_seconds=5)))
+
+        state = app_module.jobs_status["j"]
+        assert state["status"] == "done" and len(state["result"]["jobs"]) == 1
+        assert state["result"]["errors"] == [{"source": "second", "error": "deadline exceeded"}]
+
+    def test_no_deadline_by_default(self, monkeypatch):
+        scraper = FakeScraper(jobs=[])
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: [("s", scraper)])
+        app_module.jobs_status["j"] = {"status": "running", "stage": "s", "current": 0, "total": 0,
+                                       "result": None, "error": None, "created_at": time.time()}
+        app_module._run_scrape_job("j", app_module.JobsRequest(**valid_body()))
+        assert not hasattr(scraper, "deadline")
