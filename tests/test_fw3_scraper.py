@@ -7,7 +7,9 @@ Regression tests for Fw3Scraper. No real Selenium/browser/network is ever touche
   tags, schema, progress) from the extraction details already covered above.
 """
 
-from selenium.common.exceptions import TimeoutException
+import json
+
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 
 import scrapers.fw3_jobscraper as fw3mod
@@ -129,13 +131,13 @@ class TestExtractJobDetail:
 
     def test_extracts_all_fields_happy_path(self):
         driver = self._base_driver()
-        driver.find_element_map[(By.CSS_SELECTOR, "h2.JobPage_companyName__G6Nta")] = FakeElement(
+        driver.find_element_map[(By.CSS_SELECTOR, "[class*='companyName']")] = FakeElement(
             text="Maple Finance"
         )
-        driver.find_element_map[(By.CSS_SELECTOR, "div.JobPage_companyLocation__jz0CV")] = FakeElement(
+        driver.find_element_map[(By.CSS_SELECTOR, "[class*='companyLocation']")] = FakeElement(
             text="Remote"
         )
-        driver.find_elements_map[(By.CSS_SELECTOR, "div.JobPage_keyDetail__Dddhf")] = [
+        driver.find_elements_map[(By.CSS_SELECTOR, "[class*='keyDetail']")] = [
             FakeElement(text="Full-time"),
             FakeElement(text="$125K – $273K"),
         ]
@@ -476,3 +478,106 @@ class TestKnownKeysAndDeadline:
 
         assert scraper.run(["kw1"]) == []
         assert scraper.deadline_hit is True and driver.quit_called
+
+
+# ── Hardening (add-web3-job-boards) ──────────────────────────────────────────
+
+JSON_LD = By.CSS_SELECTOR, 'script[type="application/ld+json"]'
+
+
+class TestResilientSelectors:
+    def _driver(self):
+        driver = FakeDriver()
+        driver.find_element_map[(By.TAG_NAME, "h1")] = FakeElement(text="Rust Engineer")
+        return driver
+
+    def test_no_hashed_class_needed_json_ld_supplies_company_and_location(self):
+        driver = self._driver()
+        driver.find_elements_map[JSON_LD] = [FakeElement(attrs={"innerHTML": json.dumps({
+            "@type": "JobPosting", "title": "Rust Engineer", "description": "desc",
+            "hiringOrganization": {"name": "Acme"},
+            "jobLocation": {"address": {"addressLocality": "Berlin", "addressCountry": "DE"}},
+        })})]
+
+        result = make_scraper().extract_job_detail(driver, "https://findweb3.com/job/j1")
+
+        assert result["company_name"] == "Acme" and result["location"] == "Berlin, DE"
+        assert result["description_html"] == "<p>desc</p>"
+
+    def test_structural_xpath_finds_company_without_classes(self):
+        driver = self._driver()
+        driver.find_element_map[(By.XPATH, "//h1/following::h2[1]")] = FakeElement(text="Maple")
+        assert make_scraper().extract_job_detail(driver, "https://findweb3.com/job/j1")["company_name"] == "Maple"
+
+    def test_telecommute_json_ld_means_remote(self):
+        driver = self._driver()
+        driver.find_elements_map[JSON_LD] = [FakeElement(attrs={"innerHTML": json.dumps(
+            [{"@type": "JobPosting", "jobLocationType": "TELECOMMUTE"}])})]
+        assert make_scraper().extract_job_detail(driver, "https://findweb3.com/job/j1")["location"] == "Remote"
+
+    def test_total_drift_degrades_to_none_with_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            result = make_scraper().extract_job_detail(self._driver(), "https://findweb3.com/job/j1")
+        assert result["company_name"] is None and result["location"] is None
+        assert "company not found" in caplog.text and "location not found" in caplog.text
+
+    def test_malformed_json_ld_is_ignored(self):
+        driver = self._driver()
+        driver.find_elements_map[JSON_LD] = [FakeElement(attrs={"innerHTML": "{not json"})]
+        assert make_scraper().extract_job_detail(driver, "https://findweb3.com/job/j1")["company_name"] is None
+
+
+class TestDriverOptions:
+    def _captured(self, monkeypatch, which):
+        seen = {}
+        monkeypatch.setattr(fw3mod.shutil, "which", lambda name: which)
+        monkeypatch.setattr(fw3mod.webdriver, "Chrome", lambda service, options: seen.update(service=service, options=options))
+        make_scraper()._build_driver()
+        return seen
+
+    def test_no_anti_detection_flags(self, monkeypatch):
+        opts = self._captured(monkeypatch, None)["options"]
+        text = " ".join(opts.arguments) + json.dumps(opts.experimental_options, default=str)
+        assert "AutomationControlled" not in text and "excludeSwitches" not in text
+        assert "enable-automation" not in text and "user-agent" not in text
+
+    def test_chromedriver_on_path_is_used_without_download(self, monkeypatch):
+        service = self._captured(monkeypatch, "/usr/local/bin/chromedriver")["service"]
+        assert service.path == "/usr/local/bin/chromedriver"
+
+    def test_without_driver_on_path_selenium_manager_resolves(self, monkeypatch):
+        assert self._captured(monkeypatch, None)["service"].path == ""  # empty path = Selenium Manager
+        assert not hasattr(fw3mod, "ChromeDriverManager")
+
+
+class TestRetriesAndRateLimit:
+    def test_retries_then_succeeds(self):
+        class Flaky(FakeDriver):
+            attempts = 0
+
+            def get(self, url):
+                Flaky.attempts += 1
+                if Flaky.attempts < 3:
+                    raise WebDriverException("net")
+                super().get(url)
+
+        driver = Flaky()
+        driver.find_element_map[(By.TAG_NAME, "h1")] = FakeElement(text="T")
+        assert make_scraper().extract_job_detail(driver, "https://findweb3.com/job/j1")["name"] == "T"
+        assert Flaky.attempts == 3
+
+    def test_429_page_is_retried_then_given_up(self):
+        class Limited(FakeDriver):
+            title = "429 Too Many Requests"
+
+        driver = Limited()
+        driver.find_element_map[(By.TAG_NAME, "h1")] = FakeElement(text="T")
+        assert make_scraper().extract_job_detail(driver, "https://findweb3.com/job/j1") is None
+        assert driver.visited_urls == ["https://findweb3.com/job/j1"] * 3
+
+    def test_never_requests_robots_disallowed_api(self):
+        driver = FakeDriver()
+        driver.find_elements_map[(By.TAG_NAME, "a")] = [FakeElement(attrs={"href": "https://findweb3.com/job/j1"})]
+        driver.find_element_map[(By.TAG_NAME, "a")] = FakeElement()
+        make_scraper().search_by_keyword(driver, "python")
+        assert all("/api/" not in url for url in driver.visited_urls)
