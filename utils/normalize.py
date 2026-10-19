@@ -218,3 +218,10 @@ def build_row(
         "tags": tags,
         "dedupe_key": dedupe_key(company, title, location),
     }
+
+
+def set_tags(row: dict, tags) -> dict:
+    """Record the matched keywords on a row (legacy csv `Tags` + list `tags`)."""
+    row["tags"] = list(tags)
+    row["Tags"] = ", ".join(row["tags"])
+    return row
