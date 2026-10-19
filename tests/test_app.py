@@ -387,30 +387,58 @@ class TestRunScrapeJob:
         assert state["status"] == "done"
         assert state["result"]["jobs"] == [job_a, job_b]
         assert state["result"]["keywords"] == request.keywords
+        assert state["result"]["errors"] == []
 
-    def test_scraper_failure_sets_error_status_and_stops(self, monkeypatch):
+    def test_one_source_failing_keeps_other_sources_and_records_error(self, monkeypatch):
         job_a = sample_job("https://findweb3.com/job/a")
 
         monkeypatch.setattr(
             app_module,
             "_build_scrapers",
             lambda request, on_progress=None: [
-                ("findweb3.com", FakeScraper(exc=RuntimeError("boom"))),
-                ("web3.career", FakeScraper(jobs=[job_a])),
+                ("web3career", FakeScraper(exc=RuntimeError("boom\nTraceback..."))),
+                ("findweb3", FakeScraper(jobs=[job_a])),
             ],
         )
 
+        self._seed_job("job1")
+        app_module._run_scrape_job("job1", app_module.JobsRequest(**valid_body()))
+
+        state = app_module.jobs_status["job1"]
+        assert state["status"] == "done"
+        assert state["result"]["jobs"] == [job_a]
+        assert state["result"]["errors"] == [{"source": "web3career", "error": "boom Traceback..."}]
+
+    def test_all_sources_failing_sets_error_status(self, monkeypatch):
+        monkeypatch.setattr(
+            app_module,
+            "_build_scrapers",
+            lambda request, on_progress=None: [
+                ("findweb3", FakeScraper(exc=RuntimeError("boom"))),
+                ("web3career", FakeScraper(exc=RuntimeError("bang"))),
+            ],
+        )
+
+        self._seed_job("job1")
+        app_module._run_scrape_job("job1", app_module.JobsRequest(**valid_body()))
+
+        state = app_module.jobs_status["job1"]
+        assert state["status"] == "error"
+        assert "findweb3" in state["error"] and "boom" in state["error"] and "bang" in state["error"]
+        assert state["result"] is None
+
+    def test_result_envelope_on_success(self, monkeypatch):
+        monkeypatch.setattr(
+            app_module, "_build_scrapers",
+            lambda request, on_progress=None: [("findweb3", FakeScraper(jobs=[]))],
+        )
         self._seed_job("job1")
         request = app_module.JobsRequest(**valid_body())
 
         app_module._run_scrape_job("job1", request)
 
-        state = app_module.jobs_status["job1"]
-        assert state["status"] == "error"
-        assert "findweb3.com" in state["error"]
-        assert "boom" in state["error"]
-        # Second scraper must never run once an earlier one has failed.
-        assert state["result"] is None
+        result = app_module.jobs_status["job1"]["result"]
+        assert result == {"schema_version": "1", "keywords": request.keywords, "jobs": [], "errors": []}
 
     def test_build_scrapers_failure_sets_error_status(self, monkeypatch):
         def raise_build(request, on_progress=None):
@@ -482,3 +510,82 @@ class TestEndToEndJobLifecycle:
         result_response = client.get(f"/jobs/{job_id}/result")
         assert result_response.status_code == 200
         assert result_response.json()["jobs"] == [result_job]
+
+
+# ── Optional X-API-Key ──────────────────────────────────────────────────────
+
+
+class TestApiKey:
+    def test_disabled_when_env_unset(self, client, monkeypatch):
+        monkeypatch.delenv("JOB_SCRAPER_API_KEY", raising=False)
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: [])
+
+        assert client.post("/jobs", json=valid_body()).status_code == 202
+        assert client.get("/jobs/nope/status").status_code == 404  # served, not 401
+
+    @pytest.mark.parametrize("headers", [{}, {"X-API-Key": "wrong"}])
+    def test_enabled_rejects_missing_or_wrong_key_on_all_routes(self, client, monkeypatch, headers):
+        monkeypatch.setenv("JOB_SCRAPER_API_KEY", "s3cret")
+
+        assert client.post("/jobs", json=valid_body(), headers=headers).status_code == 401
+        assert client.get("/jobs/x/status", headers=headers).status_code == 401
+        assert client.get("/jobs/x/result", headers=headers).status_code == 401
+
+    def test_enabled_accepts_right_key(self, client, monkeypatch):
+        monkeypatch.setenv("JOB_SCRAPER_API_KEY", "s3cret")
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: [])
+
+        response = client.post("/jobs", json=valid_body(), headers={"X-API-Key": "s3cret"})
+
+        assert response.status_code == 202
+
+
+# ── Frontend compatibility (job_scraper_frontend/src/utils/jobRequest.js) ───
+
+
+class TestFrontendCompatibility:
+    LEGACY_ROW_KEYS = {"Job Title", "Company Name", "Job Description", "Job Location",
+                       "Compensation", "Job Url", "Tags", "Notes"}
+
+    def test_exact_frontend_body_flows_through_with_legacy_shapes(self, client, monkeypatch):
+        from utils.normalize import build_row
+
+        row = build_row(
+            {"Job Title": "Engineer", "Company Name": "Acme", "Job Description": "<p>x</p>",
+             "Job Location": "Remote", "Compensation": None, "Job Url": "https://findweb3.com/job/1"},
+            "findweb3", tags=["python"],
+        )
+        monkeypatch.setattr(
+            app_module, "_build_scrapers",
+            lambda request, on_progress=None: [("findweb3", FakeScraper(jobs=[row]))],
+        )
+        body = {  # the 7 fields the frontend sends, nothing else
+            "keywords": ["python"], "acceptable_locations": ["remote"], "anti_keywords": [],
+            "discarded_urls": [], "max_jobs_searched_per_keyword": 20, "max_jobs_saved": 5,
+            "max_experience_years": 4,
+        }
+
+        created = client.post("/jobs", json=body)
+        assert created.status_code == 202 and set(created.json()) == {"job_id"}
+        job_id = created.json()["job_id"]
+
+        status = client.get(f"/jobs/{job_id}/status").json()
+        assert set(status) == {"status", "stage", "current", "total"}
+        assert status["status"] == "done"
+
+        result = client.get(f"/jobs/{job_id}/result").json()
+        assert {"keywords", "jobs"} <= set(result)
+        assert self.LEGACY_ROW_KEYS <= set(result["jobs"][0])
+        assert result["jobs"][0]["Job Url"] == "https://findweb3.com/job/1"
+
+    def test_error_body_uses_detail_and_status_error(self, client, monkeypatch):
+        monkeypatch.setattr(
+            app_module, "_build_scrapers",
+            lambda request, on_progress=None: [("findweb3", FakeScraper(exc=RuntimeError("boom")))],
+        )
+        job_id = client.post("/jobs", json=valid_body()).json()["job_id"]
+
+        status = client.get(f"/jobs/{job_id}/status").json()
+        assert status["status"] == "error" and "boom" in status["error"]
+        result = client.get(f"/jobs/{job_id}/result")
+        assert result.status_code == 500 and "boom" in result.json()["detail"]

@@ -11,12 +11,14 @@ validation, scraper wiring, background job tracking, and the HTTP response/error
 shape.
 """
 
+import hmac
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -29,7 +31,17 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="job_scraper")
+SCHEMA_VERSION = "1"
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Enforce X-API-Key only when env JOB_SCRAPER_API_KEY is set (off by default)."""
+    expected = os.environ.get("JOB_SCRAPER_API_KEY")
+    if expected and not hmac.compare_digest(x_api_key or "", expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+app = FastAPI(title="job_scraper", dependencies=[Depends(require_api_key)])
 
 # Dev-only: allows any origin so the frontend can call this API from anywhere while
 # it's being built. Restrict this to the real frontend's production domain(s) before
@@ -120,19 +132,35 @@ def _run_scrape_job(job_id: str, request: JobsRequest) -> None:
         return
 
     all_jobs: list = []
+    errors: list = []
     for site_name, scraper in scrapers:
         try:
             all_jobs.extend(scraper.run(request.keywords))
         except Exception as exc:
             log.exception("Scraper '%s' failed for job %s", site_name, job_id)
-            jobs_status[job_id].update(status="error", error=f"Scraper '{site_name}' failed: {exc}")
-            return
+            errors.append({"source": site_name, "error": _short_error(exc)})
+
+    # Error only if every source failed (then the old frontend behaviour: show the error).
+    if scrapers and len(errors) == len(scrapers):
+        message = "; ".join(f"Scraper '{e['source']}' failed: {e['error']}" for e in errors)
+        jobs_status[job_id].update(status="error", error=message)
+        return
 
     jobs_status[job_id].update(
         status="done",
         stage="done",
-        result={"keywords": request.keywords, "jobs": all_jobs},
+        result={
+            "schema_version": SCHEMA_VERSION,
+            "keywords": request.keywords,
+            "jobs": all_jobs,
+            "errors": errors,
+        },
     )
+
+
+def _short_error(exc: Exception) -> str:
+    """One-line error text for errors[]: no stack trace, truncated."""
+    return (str(exc) or type(exc).__name__).replace("\n", " ")[:200]
 
 
 def _get_job_or_404(job_id: str) -> dict:
