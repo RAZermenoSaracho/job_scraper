@@ -9,7 +9,6 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable
 from urllib.parse import quote
 
 from selenium import webdriver
@@ -25,14 +24,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-from utils.filters import (
-    job_text,
-    passes_anti_keywords,
-    passes_discarded_urls,
-    passes_experience,
-    passes_location,
-)
-from utils.normalize import build_row, identify_url, set_tags
+from scrapers.base import BaseScraper
+from utils.normalize import build_row, identify_url
 
 log = logging.getLogger(__name__)
 
@@ -43,66 +36,48 @@ COMPENSATION_PATTERN = re.compile(
 )
 
 
-class Fw3Scraper:
+class Fw3Scraper(BaseScraper):
     """Scraper for findweb3.com job listings."""
 
-    def __init__(
-        self,
-        max_jobs_per_keyword: int = 20,
-        top_n_results: int = 10,
-        acceptable_locations: list | None = None,
-        anti_keywords: list | None = None,
-        discarded_urls: list | None = None,
-        max_experience_years: int | None = None,
-        on_progress: Callable[[str, int, int], None] | None = None,
-    ) -> None:
-        self.max_jobs_per_keyword = max_jobs_per_keyword
-        self.top_n_results = top_n_results
-        self.acceptable_locations = acceptable_locations or []
-        self.anti_keywords = anti_keywords or []
-        self.discarded_urls = set(discarded_urls or [])
-        self.max_experience_years = max_experience_years
-        self.on_progress = on_progress
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def run(self, keywords: list) -> list:
         """
         Full pipeline: scrape all keyword pages → deduplicate → visit every candidate,
-        filtering each one inline as soon as its fields are extracted. discarded_urls is
-        filtered during search itself (see search_by_keyword) so a discarded job never
-        occupies one of the max_jobs_per_keyword slots and never costs a page load; every
-        URL that reaches this stage has already passed that check. Every candidate that
-        survives the remaining filters is scored by keyword-match count; once all
-        candidates have been visited, the surviving pool is ranked by score and the
-        top_n_results best are returned — not just the first ones found to pass.
+        filtering each one inline (BaseScraper.evaluate) as soon as its fields are
+        extracted. discarded_urls and known_keys are filtered during search itself (see
+        search_by_keyword) so such a job never occupies one of the max_jobs_per_keyword
+        slots and never costs a page load. Every survivor is scored by keyword-match
+        count; once all candidates have been visited, the pool is ranked by score and the
+        top_n_results best are returned — not just the first ones found to pass. Stops
+        early when the run deadline passes.
 
-        Accepts keywords as input; returns a clean list of job dicts matching the
-        output schema (Job Title, Company Name, Job Description, Job Location,
-        Compensation, Job Url, Tags, Notes). Does not read or write any files.
-
-        If on_progress was passed to __init__, it's called as on_progress(stage, current,
-        total) at the same points this method logs progress — callers (e.g. an API layer
-        tracking a background job) can use it to report progress without this class knowing
-        anything about how that's surfaced.
+        Returns normalized job rows (legacy keys Job Title, Company Name, Job Description,
+        Job Location, Compensation, Job Url, Tags, Notes plus the normalized fields).
+        Does not read or write any files. If on_progress was passed to __init__, it's
+        called as on_progress(stage, current, total) at the same points this method logs.
         """
         driver = self._build_driver()
         ordered_urls: dict = {}  # dict used as an ordered set
-
-        candidates: list = []  # (score, job) for every candidate that passed all filters
-        drop_counts = {"discarded_urls": 0, "location": 0, "anti_keywords": 0, "experience": 0}
+        candidates: list = []  # (score, row) for every candidate that passed all filters
+        drops: dict = {"discarded_urls": 0}
 
         try:
             for i, kw in enumerate(keywords, start=1):
+                if self.expired():
+                    break
                 self._report("searching_keywords", i, len(keywords))
                 urls, discarded_count = self.search_by_keyword(driver, kw)
-                drop_counts["discarded_urls"] += discarded_count
+                drops["discarded_urls"] += discarded_count
                 for url in urls:
                     ordered_urls[url] = None
 
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
 
             for n, url in enumerate(ordered_urls, start=1):
+                if self.expired():
+                    break
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
                 self._report("scraping", n, len(ordered_urls))
                 raw = self.extract_job_detail(driver, url)
@@ -123,48 +98,13 @@ class Fw3Scraper:
                     source_job_id=identify_url(raw["url"])["source_job_id"],
                     id_fallback=True,
                 )
-
-                if not passes_location(job, self.acceptable_locations):
-                    drop_counts["location"] += 1
-                    continue
-                if not passes_anti_keywords(job, self.anti_keywords):
-                    drop_counts["anti_keywords"] += 1
-                    continue
-                if not passes_experience(job, self.max_experience_years):
-                    drop_counts["experience"] += 1
-                    continue
-
-                tags = self.match_keywords(job_text(job), keywords)
-                set_tags(job, tags)
-
-                candidates.append((len(tags), job))
-
+                score = self.evaluate(job, keywords, drops)
+                if score is not None:
+                    candidates.append((score, job))
         finally:
             driver.quit()
 
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        selected = candidates[: self.top_n_results]
-
-        total_seen = len(ordered_urls) + drop_counts["discarded_urls"]
-        log.info(
-            "Filtered %d candidate(s) found: %d passed "
-            "(dropped — discarded_urls: %d, location: %d, anti_keywords: %d, experience: %d)",
-            total_seen,
-            len(candidates),
-            drop_counts["discarded_urls"],
-            drop_counts["location"],
-            drop_counts["anti_keywords"],
-            drop_counts["experience"],
-        )
-        self._report("filtering", len(candidates), len(ordered_urls))
-        if selected:
-            scores = [score for score, _ in selected]
-            log.info(
-                "Selected top %d of %d passing candidate(s) — score min: %d, max: %d",
-                len(selected), len(candidates), min(scores), max(scores),
-            )
-
-        return [job for _, job in selected]
+        return self.select(candidates, drops, len(ordered_urls))
 
     def search_by_keyword(self, driver: webdriver.Chrome, keyword: str) -> tuple[list, int]:
         """
@@ -203,7 +143,7 @@ class Fw3Scraper:
                 continue
             seen.add(href)
 
-            if not passes_discarded_urls(href, self.discarded_urls):
+            if self.skip_url(href):
                 discarded_count += 1
                 continue
 
@@ -253,18 +193,7 @@ class Fw3Scraper:
             "description_html": description_html,
         }
 
-    @staticmethod
-    def match_keywords(text: str, keywords: list) -> list:
-        """Return the subset of keywords (original casing) present in text (case-insensitive)."""
-        lowered = text.lower()
-        return [kw for kw in keywords if kw.lower() in lowered]
-
     # ── Private helpers ────────────────────────────────────────────────────────
-
-    def _report(self, stage: str, current: int, total: int) -> None:
-        """Invoke the optional progress callback, if one was provided."""
-        if self.on_progress:
-            self.on_progress(stage, current, total)
 
     def _build_driver(self) -> webdriver.Chrome:
         opts = Options()

@@ -11,6 +11,7 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 
 import scrapers.fw3_jobscraper as fw3mod
+import scrapers.base as basemod
 from scrapers.fw3_jobscraper import Fw3Scraper
 from tests.conftest import FakeDriver, FakeElement
 
@@ -248,26 +249,26 @@ class TestRun:
     def test_filters_applied_in_order_location_then_anti_keywords_then_experience(self, monkeypatch):
         call_order = []
         real_location, real_anti, real_experience = (
-            fw3mod.passes_location,
-            fw3mod.passes_anti_keywords,
-            fw3mod.passes_experience,
+            basemod.passes_location,
+            basemod.passes_anti_keywords,
+            basemod.passes_experience,
         )
 
         def spy_location(job, locations):
             call_order.append("location")
             return real_location(job, locations)
 
-        def spy_anti(job, anti_kw):
+        def spy_anti(job, anti_kw, *_mode):
             call_order.append("anti_keywords")
-            return real_anti(job, anti_kw)
+            return real_anti(job, anti_kw, *_mode)
 
         def spy_experience(job, max_years):
             call_order.append("experience")
             return real_experience(job, max_years)
 
-        monkeypatch.setattr(fw3mod, "passes_location", spy_location)
-        monkeypatch.setattr(fw3mod, "passes_anti_keywords", spy_anti)
-        monkeypatch.setattr(fw3mod, "passes_experience", spy_experience)
+        monkeypatch.setattr(basemod, "passes_location", spy_location)
+        monkeypatch.setattr(basemod, "passes_anti_keywords", spy_anti)
+        monkeypatch.setattr(basemod, "passes_experience", spy_experience)
 
         scraper, _driver, _calls = self._scraper_with_mocks(
             monkeypatch,
@@ -289,20 +290,20 @@ class TestRun:
     def test_location_failure_short_circuits_remaining_filters(self, monkeypatch):
         call_order = []
         real_location, real_anti, real_experience = (
-            fw3mod.passes_location,
-            fw3mod.passes_anti_keywords,
-            fw3mod.passes_experience,
+            basemod.passes_location,
+            basemod.passes_anti_keywords,
+            basemod.passes_experience,
         )
         monkeypatch.setattr(
-            fw3mod, "passes_location",
+            basemod, "passes_location",
             lambda job, locs: call_order.append("location") or real_location(job, locs),
         )
         monkeypatch.setattr(
-            fw3mod, "passes_anti_keywords",
-            lambda job, kw: call_order.append("anti_keywords") or real_anti(job, kw),
+            basemod, "passes_anti_keywords",
+            lambda job, kw, *a: call_order.append("anti_keywords") or real_anti(job, kw),
         )
         monkeypatch.setattr(
-            fw3mod, "passes_experience",
+            basemod, "passes_experience",
             lambda job, yrs: call_order.append("experience") or real_experience(job, yrs),
         )
 
@@ -450,3 +451,28 @@ class TestNormalizedRow:
         assert row["source_job_id"] == "recoUnkn8Eb9kNPcK"
         assert row["canonical_url"] == "https://findweb3.com/job/recoUnkn8Eb9kNPcK"
         assert row["Job Url"] == url  # legacy value untouched
+
+
+class TestKnownKeysAndDeadline:
+    def test_known_url_takes_no_slot_and_is_not_visited(self, monkeypatch):
+        hrefs = [f"https://findweb3.com/job/job{i}" for i in range(1, 5)]
+        driver = FakeDriver()
+        driver.find_elements_map[(By.TAG_NAME, "a")] = [FakeElement(attrs={"href": h}) for h in hrefs]
+        driver.find_element_map[(By.TAG_NAME, "a")] = FakeElement()
+        scraper = make_scraper(max_jobs_per_keyword=2, known_keys=["findweb3:job1"])
+
+        urls, skipped = scraper.search_by_keyword(driver, "python")
+
+        assert urls == hrefs[1:3] and skipped == 1
+        assert driver.visited_urls == ["https://findweb3.com/jobs/python"]  # no detail page
+
+    def test_deadline_stops_run_and_flags_it(self, monkeypatch):
+        scraper = Fw3Scraper(deadline=0.0)
+        driver = FakeDriver()
+        monkeypatch.setattr(scraper, "_build_driver", lambda: driver)
+        monkeypatch.setattr(
+            scraper, "search_by_keyword", lambda d, kw: (_ for _ in ()).throw(AssertionError("searched"))
+        )
+
+        assert scraper.run(["kw1"]) == []
+        assert scraper.deadline_hit is True and driver.quit_called
