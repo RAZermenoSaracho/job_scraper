@@ -14,6 +14,7 @@ shape.
 import hmac
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -22,7 +23,7 @@ from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from scrapers import DEFAULT_SOURCES, SOURCES, catalog, source_state
 
@@ -82,6 +83,18 @@ class JobsRequest(BaseModel):
     excluded_companies: list[str] = []
     deadline_seconds: float | None = Field(default=None, gt=0)
     match_mode: Literal["substring", "word"] = "substring"
+    boards: list[str] = []  # ATS boards as "<greenhouse|lever|ashby>:<token>"
+
+    @field_validator("boards")
+    @classmethod
+    def _check_boards(cls, boards: list[str]) -> list[str]:
+        seen: dict = {}
+        for entry in boards:
+            m = re.fullmatch(r"(greenhouse|lever|ashby):([A-Za-z0-9._-]+)", entry.strip(), re.IGNORECASE)
+            if not m:
+                raise ValueError(f"invalid board '{entry}': expected <greenhouse|lever|ashby>:<token>")
+            seen.setdefault(f"{m[1]}:{m[2]}".lower(), f"{m[1].lower()}:{m[2]}")
+        return list(seen.values())
 
 
 def _purge_old_jobs() -> None:
@@ -117,7 +130,17 @@ def _build_scrapers(
         excluded_companies=request.excluded_companies,
         match_mode=request.match_mode,
     )
-    return [(sid, SOURCES[sid]["adapter"](**kwargs)) for sid in source_ids]
+    scrapers = [
+        (sid, SOURCES[sid]["adapter"](**kwargs))
+        for sid in source_ids if SOURCES[sid]["category"] != "ats"
+    ]
+    # ATS adapters run only for the vendors of the requested boards (and, if `sources` is
+    # given, only when the vendor id is listed there).
+    for ats in ("greenhouse", "lever", "ashby"):
+        tokens = [b.split(":", 1)[1] for b in request.boards if b.startswith(f"{ats}:")]
+        if tokens and (request.sources is None or ats in request.sources):
+            scrapers.append((ats, SOURCES[ats]["adapter"](boards=tokens, **kwargs)))
+    return scrapers
 
 
 def _score(job: dict) -> int:

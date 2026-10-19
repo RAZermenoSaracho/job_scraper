@@ -13,6 +13,7 @@ registered AND its requires_config is satisfied.
 
 import os
 
+from scrapers.ats_scraper import AshbyScraper, GreenhouseScraper, LeverScraper
 from scrapers.fw3_jobscraper import Fw3Scraper
 from scrapers.web3career_jobscraper import Web3CareerScraper
 
@@ -32,6 +33,22 @@ SOURCES = {
         "adapter": Web3CareerScraper, "label": "web3.career", "category": "job_board",
         "availability": "available", "needs_browser": False, "requires_config": None,
         "filters": FILTERS, "hosts": ["web3.career"], "ingestion": None,
+    },
+    # ATS boards are selected via the request's `boards` list ("<ats>:<token>").
+    "greenhouse": {
+        "adapter": GreenhouseScraper, "label": "Greenhouse", "category": "ats",
+        "availability": "available", "needs_browser": False, "requires_config": "boards",
+        "filters": FILTERS, "hosts": ["boards.greenhouse.io", "job-boards.greenhouse.io"], "ingestion": None,
+    },
+    "lever": {
+        "adapter": LeverScraper, "label": "Lever", "category": "ats",
+        "availability": "available", "needs_browser": False, "requires_config": "boards",
+        "filters": FILTERS, "hosts": ["jobs.lever.co"], "ingestion": None,
+    },
+    "ashby": {
+        "adapter": AshbyScraper, "label": "Ashby", "category": "ats",
+        "availability": "available", "needs_browser": False, "requires_config": "boards",
+        "filters": FILTERS, "hosts": ["jobs.ashbyhq.com"], "ingestion": None,
     },
 }
 

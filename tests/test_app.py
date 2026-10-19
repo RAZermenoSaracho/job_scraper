@@ -807,3 +807,73 @@ class TestDeadline:
                                        "result": None, "error": None, "created_at": time.time()}
         app_module._run_scrape_job("j", app_module.JobsRequest(**valid_body()))
         assert not hasattr(scraper, "deadline")
+
+
+# ── add-ats-sources: boards field and wiring ────────────────────────────────
+
+
+class TestBoards:
+    def test_valid_boards_accepted_and_deduped_case_insensitively(self):
+        request = app_module.JobsRequest(**valid_body(
+            boards=["greenhouse:stripe", "lever:netflix", "ashby:ramp", "Greenhouse:Stripe"]))
+        assert request.boards == ["greenhouse:stripe", "lever:netflix", "ashby:ramp"]
+
+    @pytest.mark.parametrize("bad", ["workday:acme", "stripe", "lever:", "lever:a b", "lever:a/b"])
+    def test_malformed_entry_422_and_no_job(self, client, bad):
+        response = client.post("/jobs", json=valid_body(boards=[bad]))
+        assert response.status_code == 422 and app_module.jobs_status == {}
+
+    def test_omitted_boards_builds_no_ats_scraper(self):
+        names = [n for n, _ in app_module._build_scrapers(app_module.JobsRequest(**valid_body()))]
+        assert names == ["findweb3", "web3career"]
+
+    def test_boards_build_one_scraper_per_vendor_with_tokens(self, monkeypatch):
+        seen = {}
+
+        class Spy:
+            def __init__(self, boards=None, **kw): seen.setdefault(self.__class__.__name__, boards)
+
+        for vendor in ("greenhouse", "lever", "ashby"):
+            monkeypatch.setitem(SOURCES, vendor, {**SOURCES[vendor], "adapter": type(vendor, (Spy,), {})})
+        request = app_module.JobsRequest(**valid_body(
+            boards=["greenhouse:stripe", "greenhouse:gitlab", "lever:netflix"]))
+
+        names = [n for n, _ in app_module._build_scrapers(request)]
+
+        assert names == ["findweb3", "web3career", "greenhouse", "lever"]
+        assert seen == {"greenhouse": ["stripe", "gitlab"], "lever": ["netflix"]}
+
+    def test_explicit_sources_limit_which_vendors_run(self, monkeypatch):
+        request = app_module.JobsRequest(**valid_body(
+            sources=["lever"], boards=["greenhouse:stripe", "lever:netflix"]))
+        assert [n for n, _ in app_module._build_scrapers(request)] == ["lever"]
+
+    def test_ats_ids_listed_in_catalog_as_executable(self, client):
+        by_id = {s["id"]: s for s in client.get("/sources").json()["sources"]}
+        for vendor in ("greenhouse", "lever", "ashby"):
+            assert by_id[vendor]["category"] == "ats" and by_id[vendor]["executable"] is True
+            assert by_id[vendor]["requires_config"] == "boards"
+
+    def test_per_board_failures_reach_errors_and_do_not_fail_the_run(self, monkeypatch):
+        class BoardScraper:
+            errors = [{"source": "lever:netflix", "error": "HTTP 404 (not found)"}]
+
+            def run(self, keywords):
+                return [make_row("https://jobs.lever.co/x/1", source="lever")]
+
+        class AllBoardsFailed:
+            errors = [{"source": "greenhouse:a", "error": "HTTP 404"}, {"source": "greenhouse:b", "error": "HTTP 404"}]
+
+            def run(self, keywords):
+                raise RuntimeError("all greenhouse boards failed")
+
+        monkeypatch.setattr(app_module, "_build_scrapers", lambda request, on_progress=None: [
+            ("lever", BoardScraper()), ("greenhouse", AllBoardsFailed())])
+        app_module.jobs_status["j"] = {"status": "running", "stage": "s", "current": 0, "total": 0,
+                                       "result": None, "error": None, "created_at": time.time()}
+        app_module._run_scrape_job("j", app_module.JobsRequest(**valid_body()))
+
+        state = app_module.jobs_status["j"]
+        assert state["status"] == "done" and len(state["result"]["jobs"]) == 1
+        assert [e["source"] for e in state["result"]["errors"]] == [
+            "lever:netflix", "greenhouse:a", "greenhouse:b"]
