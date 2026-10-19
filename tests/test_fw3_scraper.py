@@ -366,16 +366,17 @@ class TestRun:
         result = scraper.run(["kw1"])
 
         assert len(result) == 1
-        assert set(result[0].keys()) == {
-            "Job Title",
-            "Company Name",
-            "Job Description",
-            "Job Location",
-            "Compensation",
-            "Job Url",
-            "Tags",
-            "Notes",
-        }
+        legacy = {"Job Title", "Company Name", "Job Description", "Job Location",
+                  "Compensation", "Job Url", "Tags", "Notes"}
+        normalized = {"source", "source_job_id", "canonical_url", "apply_url", "company", "title",
+                      "location", "work_mode", "posted_at", "description_html", "description_text",
+                      "salary", "ats_type", "tags", "dedupe_key"}
+        assert set(result[0].keys()) == legacy | normalized
+        # Legacy values keep their meaning next to the additive normalized fields.
+        assert result[0]["Job Url"] == "url1"
+        assert result[0]["Job Description"] == "kw1 description"
+        assert result[0]["Tags"] == "kw1" and result[0]["tags"] == ["kw1"]
+        assert result[0]["source"] == "findweb3"
         assert result[0]["Notes"] == ""
 
     def test_candidate_extraction_failure_is_skipped_not_fatal(self, monkeypatch):
@@ -434,3 +435,18 @@ class TestRun:
         result = scraper.run(["kw1"])
 
         assert len(result) == 1
+
+
+class TestNormalizedRow:
+    def test_source_job_id_from_url_slug(self, monkeypatch):
+        url = "https://findweb3.com/job/recoUnkn8Eb9kNPcK?utm_source=x"
+        scraper = Fw3Scraper()
+        monkeypatch.setattr(scraper, "_build_driver", lambda: FakeDriver())
+        monkeypatch.setattr(scraper, "search_by_keyword", lambda d, kw: ([url], 0))
+        monkeypatch.setattr(scraper, "extract_job_detail", lambda d, u: raw_job(u, "kw1"))
+
+        row = scraper.run(["kw1"])[0]
+
+        assert row["source_job_id"] == "recoUnkn8Eb9kNPcK"
+        assert row["canonical_url"] == "https://findweb3.com/job/recoUnkn8Eb9kNPcK"
+        assert row["Job Url"] == url  # legacy value untouched

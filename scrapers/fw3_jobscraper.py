@@ -32,6 +32,7 @@ from utils.filters import (
     passes_experience,
     passes_location,
 )
+from utils.normalize import build_row, identify_url, set_tags
 
 log = logging.getLogger(__name__)
 
@@ -109,14 +110,19 @@ class Fw3Scraper:
                 if not raw:
                     continue
 
-                job = {
-                    "Job Title": raw["name"],
-                    "Company Name": raw["company_name"],
-                    "Job Description": raw["description_html"],
-                    "Job Location": raw["location"],
-                    "Compensation": raw["compensation"],
-                    "Job Url": raw["url"],
-                }
+                job = build_row(
+                    {
+                        "Job Title": raw["name"],
+                        "Company Name": raw["company_name"],
+                        "Job Description": raw["description_html"],
+                        "Job Location": raw["location"],
+                        "Compensation": raw["compensation"],
+                        "Job Url": raw["url"],
+                    },
+                    "findweb3",
+                    source_job_id=identify_url(raw["url"])["source_job_id"],
+                    id_fallback=True,
+                )
 
                 if not passes_location(job, self.acceptable_locations):
                     drop_counts["location"] += 1
@@ -129,8 +135,7 @@ class Fw3Scraper:
                     continue
 
                 tags = self.match_keywords(job_text(job), keywords)
-                job["Tags"] = ", ".join(tags)
-                job["Notes"] = ""
+                set_tags(job, tags)
 
                 candidates.append((len(tags), job))
 
