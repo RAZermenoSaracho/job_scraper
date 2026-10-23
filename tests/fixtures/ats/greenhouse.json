@@ -1,0 +1,34 @@
+{
+  "_note": "Hand-written from the documented boards-api.greenhouse.io response shape (the single permitted live capture was lost to a tooling error); not a verbatim vendor response.",
+  "jobs": [
+    {
+      "id": 4012345,
+      "internal_job_id": 3300111,
+      "title": "Backend Engineer",
+      "updated_at": "2026-10-12T09:15:03-04:00",
+      "first_published": "2026-09-30T10:00:00-04:00",
+      "requisition_id": "REQ-1",
+      "company_name": "Stripe",
+      "location": {"name": "Remote - Americas"},
+      "absolute_url": "https://job-boards.greenhouse.io/stripe/jobs/4012345?gh_src=abc",
+      "metadata": null,
+      "departments": [{"id": 1, "name": "Engineering"}],
+      "offices": [{"id": 2, "name": "Remote"}],
+      "content": "&lt;p&gt;Build &amp;amp; ship &lt;strong&gt;Solidity&lt;/strong&gt; services with 3+ years of experience.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;Python&lt;/li&gt;&lt;/ul&gt;"
+    },
+    {
+      "id": 4012346,
+      "internal_job_id": 3300112,
+      "title": "Senior Account Executive",
+      "updated_at": "2026-10-10T11:00:00-04:00",
+      "requisition_id": null,
+      "company_name": "Stripe",
+      "location": {"name": "New York, NY (On-site)"},
+      "absolute_url": "https://boards.greenhouse.io/stripe/jobs/4012346",
+      "departments": [{"id": 3, "name": "Sales"}],
+      "offices": [],
+      "content": "&lt;p&gt;Sell payments products. 8+ years of experience required.&lt;/p&gt;"
+    }
+  ],
+  "meta": {"total": 2}
+}

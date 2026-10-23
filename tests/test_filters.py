@@ -2,12 +2,22 @@
 Unit tests for utils/filters.py predicates. All are pure functions — no mocking needed.
 """
 
+import pytest
+
 from utils.filters import (
+    expand_known_keys,
     job_text,
     passes_anti_keywords,
     passes_discarded_urls,
+    passes_excluded_companies,
     passes_experience,
     passes_location,
+    passes_seniority,
+    passes_since,
+    passes_work_mode,
+    row_is_known,
+    term_hits,
+    url_is_known,
 )
 
 
@@ -196,3 +206,103 @@ class TestJobText:
         assert passes_anti_keywords(job, ["clearance required"]) is False
         # "senior" only appears in the class attribute, which is stripped along with the tag
         assert passes_anti_keywords(job, ["class=\"senior\""]) is True
+
+
+# ── improve-discovery-filters ────────────────────────────────────────────────
+
+def _legacy_anti(job, anti_keywords):
+    """Verbatim pre-change implementation, kept as the oracle for the default mode."""
+    if not anti_keywords:
+        return True
+    text = job_text(job).lower()
+    return not any(kw.lower() in text for kw in anti_keywords)
+
+
+def _legacy_match(text, keywords):
+    lowered = text.lower()
+    return [kw for kw in keywords if kw.lower() in lowered]
+
+
+CORPUS_TEXTS = [
+    ("Go Engineer", "<p>Work with MongoDB and Go. 3+ years</p>"),
+    ("Smart Contracts Dev", "<p>Solidity, smart  contracts, Zürich</p>"),
+    ("Category Manager", "<div>category things; clearance required</div>"),
+    ("", ""), ("Rust", None),
+]
+CORPUS_TERMS = [["go"], ["smart contracts", "solidity"], ["clearance required", "rust"], ["zurich"], ["PYTHON"], []]
+
+
+class TestTermHitsLegacyEquivalence:
+    @pytest.mark.parametrize("title,desc", CORPUS_TEXTS)
+    @pytest.mark.parametrize("terms", CORPUS_TERMS)
+    def test_default_mode_equals_old_code(self, title, desc, terms):
+        job = {"Job Title": title, "Job Description": desc}
+        assert passes_anti_keywords(job, terms) == _legacy_anti(job, terms)
+        assert term_hits(job, terms) == _legacy_match(job_text(job), terms)
+        assert passes_anti_keywords(job, terms, "substring") == _legacy_anti(job, terms)
+
+
+class TestTermHitsWordMode:
+    def job(self, text, title="T"):
+        return {"Job Title": title, "Job Description": f"<p>{text}</p>"}
+
+    def test_substring_default_excludes_on_mongodb(self):
+        assert not passes_anti_keywords(self.job("we use mongodb"), ["go"])
+
+    def test_word_mode_avoids_false_positive(self):
+        assert passes_anti_keywords(self.job("we use mongodb"), ["go"], "word")
+        assert not passes_anti_keywords(self.job("we use Go daily"), ["go"], "word")
+
+    def test_phrase_case_punctuation_counts_once(self):
+        job = self.job("Senior SMART  Contracts, Solidity")
+        assert term_hits(job, ["smart contracts", "smart contracts"], "word") == ["smart contracts"]
+
+    def test_accents(self):
+        assert not passes_anti_keywords(self.job("Based in Zürich"), ["zurich"], "word")
+
+    def test_empty_terms_ignored(self):
+        assert term_hits(self.job("x"), ["", "  "], "word") == []
+        assert passes_anti_keywords(self.job("x"), [""])
+
+    def test_ranking_counts_unique_keywords(self):
+        job = self.job("python python python rust", title="Dev")
+        assert len(term_hits(job, ["python", "rust", "go"])) == 2
+
+    def test_same_rule_for_any_source_row(self):
+        text = "Python and mongodb"
+        rows = [{"Job Title": "A", "Job Description": text, "source": s} for s in ("findweb3", "web3career", "lever")]
+        assert len({tuple(term_hits(r, ["go", "python"], "word")) for r in rows}) == 1
+
+
+class TestNewPredicates:
+    def test_since(self):
+        since = "2026-10-01T00:00:00Z"
+        old, new, undated = ({"posted_at": d} for d in ("2026-09-15T00:00:00Z", "2026-10-10T00:00:00Z", None))
+        assert [passes_since(j, since) for j in (old, new, undated)] == [False, True, True]
+        assert passes_since(old, None)
+
+    def test_work_mode(self):
+        modes = ["remote"]
+        assert [passes_work_mode({"work_mode": m}, modes) for m in ("onsite", "remote", "unknown")] == [False, True, True]
+        assert passes_work_mode({"work_mode": "onsite"}, [])
+
+    def test_seniority_whole_word_title_only(self):
+        assert not passes_seniority({"Job Title": "Senior Engineer"}, ["senior"])
+        assert passes_seniority({"Job Title": "Seniority Analyst"}, ["senior"])
+        assert passes_seniority({"Job Title": "Dev", "Job Description": "work with senior staff"}, ["senior"])
+        assert not passes_seniority({"Job Title": "Sr. Staff-Engineer"}, ["staff"])
+
+    def test_excluded_companies_equality(self):
+        assert not passes_excluded_companies({"Company Name": "acme inc"}, ["ACME, Inc."])
+        assert passes_excluded_companies({"Company Name": "Acme Labs"}, ["acme"])
+        assert passes_excluded_companies({"Company Name": None}, ["acme"])
+
+    def test_known_keys_forms(self):
+        known = expand_known_keys(["https://web3.career/x/9?utm_source=a", "findweb3:rec1", "acme|dev|remote"])
+        assert url_is_known("https://web3.career/x/9/", known)
+        assert url_is_known("https://findweb3.com/job/rec1", known)
+        assert not url_is_known("https://findweb3.com/job/rec2", known)
+        assert row_is_known({"dedupe_key": "acme|dev|remote"}, known)
+        assert row_is_known({"source": "findweb3", "source_job_id": "rec1"}, known)
+        assert not row_is_known({"dedupe_key": "||"}, expand_known_keys(["||"]))
+        assert not row_is_known({"canonical_url": "x"}, set())

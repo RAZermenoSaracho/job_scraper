@@ -1,15 +1,21 @@
 """
 Scraper for findweb3.com.
 
-robots.txt check (2026-07-03): only a Sitemap directive, no Disallow rules.
-All paths are open to crawlers.
+robots.txt check (2026-07-03): only a Sitemap directive, no Disallow rules for the pages
+visited here. This scraper never calls findweb3.com/api/ (disallowed in robots.txt as of
+the 2026-10-19 research) and passes no anti-detection browser options.
+
+Selectors do not depend on hashed CSS-module class names: company/location use
+class-substring selectors (`[class*='companyName']`), then structural XPath and the
+page's JobPosting JSON-LD; a field that no strategy finds is None with a logged warning.
 """
 
+import json
 import logging
 import random
 import re
+import shutil
 import time
-from collections.abc import Callable
 from urllib.parse import quote
 
 from selenium import webdriver
@@ -23,17 +29,13 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
-from utils.filters import (
-    job_text,
-    passes_anti_keywords,
-    passes_discarded_urls,
-    passes_experience,
-    passes_location,
-)
+from scrapers.base import BaseScraper
+from utils.normalize import build_row, identify_url
 
 log = logging.getLogger(__name__)
+
+_RETRIES = 3
 
 # Matches a compensation value or range, e.g. "$125K – $273K", "€85,176K", "£90K-£120K".
 # Currency symbol may appear once (start only) or on both sides of the range.
@@ -42,66 +44,48 @@ COMPENSATION_PATTERN = re.compile(
 )
 
 
-class Fw3Scraper:
+class Fw3Scraper(BaseScraper):
     """Scraper for findweb3.com job listings."""
 
-    def __init__(
-        self,
-        max_jobs_per_keyword: int = 20,
-        top_n_results: int = 10,
-        acceptable_locations: list | None = None,
-        anti_keywords: list | None = None,
-        discarded_urls: list | None = None,
-        max_experience_years: int | None = None,
-        on_progress: Callable[[str, int, int], None] | None = None,
-    ) -> None:
-        self.max_jobs_per_keyword = max_jobs_per_keyword
-        self.top_n_results = top_n_results
-        self.acceptable_locations = acceptable_locations or []
-        self.anti_keywords = anti_keywords or []
-        self.discarded_urls = set(discarded_urls or [])
-        self.max_experience_years = max_experience_years
-        self.on_progress = on_progress
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def run(self, keywords: list) -> list:
         """
         Full pipeline: scrape all keyword pages → deduplicate → visit every candidate,
-        filtering each one inline as soon as its fields are extracted. discarded_urls is
-        filtered during search itself (see search_by_keyword) so a discarded job never
-        occupies one of the max_jobs_per_keyword slots and never costs a page load; every
-        URL that reaches this stage has already passed that check. Every candidate that
-        survives the remaining filters is scored by keyword-match count; once all
-        candidates have been visited, the surviving pool is ranked by score and the
-        top_n_results best are returned — not just the first ones found to pass.
+        filtering each one inline (BaseScraper.evaluate) as soon as its fields are
+        extracted. discarded_urls and known_keys are filtered during search itself (see
+        search_by_keyword) so such a job never occupies one of the max_jobs_per_keyword
+        slots and never costs a page load. Every survivor is scored by keyword-match
+        count; once all candidates have been visited, the pool is ranked by score and the
+        top_n_results best are returned — not just the first ones found to pass. Stops
+        early when the run deadline passes.
 
-        Accepts keywords as input; returns a clean list of job dicts matching the
-        output schema (Job Title, Company Name, Job Description, Job Location,
-        Compensation, Job Url, Tags, Notes). Does not read or write any files.
-
-        If on_progress was passed to __init__, it's called as on_progress(stage, current,
-        total) at the same points this method logs progress — callers (e.g. an API layer
-        tracking a background job) can use it to report progress without this class knowing
-        anything about how that's surfaced.
+        Returns normalized job rows (legacy keys Job Title, Company Name, Job Description,
+        Job Location, Compensation, Job Url, Tags, Notes plus the normalized fields).
+        Does not read or write any files. If on_progress was passed to __init__, it's
+        called as on_progress(stage, current, total) at the same points this method logs.
         """
         driver = self._build_driver()
         ordered_urls: dict = {}  # dict used as an ordered set
-
-        candidates: list = []  # (score, job) for every candidate that passed all filters
-        drop_counts = {"discarded_urls": 0, "location": 0, "anti_keywords": 0, "experience": 0}
+        candidates: list = []  # (score, row) for every candidate that passed all filters
+        drops: dict = {"discarded_urls": 0}
 
         try:
             for i, kw in enumerate(keywords, start=1):
+                if self.expired():
+                    break
                 self._report("searching_keywords", i, len(keywords))
                 urls, discarded_count = self.search_by_keyword(driver, kw)
-                drop_counts["discarded_urls"] += discarded_count
+                drops["discarded_urls"] += discarded_count
                 for url in urls:
                     ordered_urls[url] = None
 
             log.info("Unique job URLs to scrape: %d", len(ordered_urls))
 
             for n, url in enumerate(ordered_urls, start=1):
+                if self.expired():
+                    break
                 log.info(f"Scrapped: {n} / {len(ordered_urls)}")
                 self._report("scraping", n, len(ordered_urls))
                 raw = self.extract_job_detail(driver, url)
@@ -109,57 +93,26 @@ class Fw3Scraper:
                 if not raw:
                     continue
 
-                job = {
-                    "Job Title": raw["name"],
-                    "Company Name": raw["company_name"],
-                    "Job Description": raw["description_html"],
-                    "Job Location": raw["location"],
-                    "Compensation": raw["compensation"],
-                    "Job Url": raw["url"],
-                }
-
-                if not passes_location(job, self.acceptable_locations):
-                    drop_counts["location"] += 1
-                    continue
-                if not passes_anti_keywords(job, self.anti_keywords):
-                    drop_counts["anti_keywords"] += 1
-                    continue
-                if not passes_experience(job, self.max_experience_years):
-                    drop_counts["experience"] += 1
-                    continue
-
-                tags = self.match_keywords(job_text(job), keywords)
-                job["Tags"] = ", ".join(tags)
-                job["Notes"] = ""
-
-                candidates.append((len(tags), job))
-
+                job = build_row(
+                    {
+                        "Job Title": raw["name"],
+                        "Company Name": raw["company_name"],
+                        "Job Description": raw["description_html"],
+                        "Job Location": raw["location"],
+                        "Compensation": raw["compensation"],
+                        "Job Url": raw["url"],
+                    },
+                    "findweb3",
+                    source_job_id=identify_url(raw["url"])["source_job_id"],
+                    id_fallback=True,
+                )
+                score = self.evaluate(job, keywords, drops)
+                if score is not None:
+                    candidates.append((score, job))
         finally:
             driver.quit()
 
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        selected = candidates[: self.top_n_results]
-
-        total_seen = len(ordered_urls) + drop_counts["discarded_urls"]
-        log.info(
-            "Filtered %d candidate(s) found: %d passed "
-            "(dropped — discarded_urls: %d, location: %d, anti_keywords: %d, experience: %d)",
-            total_seen,
-            len(candidates),
-            drop_counts["discarded_urls"],
-            drop_counts["location"],
-            drop_counts["anti_keywords"],
-            drop_counts["experience"],
-        )
-        self._report("filtering", len(candidates), len(ordered_urls))
-        if selected:
-            scores = [score for score, _ in selected]
-            log.info(
-                "Selected top %d of %d passing candidate(s) — score min: %d, max: %d",
-                len(selected), len(candidates), min(scores), max(scores),
-            )
-
-        return [job for _, job in selected]
+        return self.select(candidates, drops, len(ordered_urls))
 
     def search_by_keyword(self, driver: webdriver.Chrome, keyword: str) -> tuple[list, int]:
         """
@@ -179,15 +132,10 @@ class Fw3Scraper:
         url = f"https://findweb3.com/jobs/{slug}"
         log.info("Searching keyword '%s' → %s", keyword, url)
 
-        try:
-            driver.get(url)
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.TAG_NAME, "a"))
-            )
-            time.sleep(random.uniform(1.5, 2.5))
-        except TimeoutException:
-            log.warning("Timeout loading '%s'", url)
+        if not self._load(driver, url, By.TAG_NAME, "a", timeout=15):
+            log.warning("Giving up on '%s'", url)
             return [], 0
+        time.sleep(random.uniform(1.5, 2.5))
 
         job_urls = []
         seen = set()
@@ -198,7 +146,7 @@ class Fw3Scraper:
                 continue
             seen.add(href)
 
-            if not passes_discarded_urls(href, self.discarded_urls):
+            if self.skip_url(href):
                 discarded_count += 1
                 continue
 
@@ -214,15 +162,10 @@ class Fw3Scraper:
         Navigate to a findweb3.com job detail page and extract structured fields.
         Returns None on unrecoverable failure so the caller can skip and continue.
         """
-        try:
-            driver.get(job_url)
-            WebDriverWait(driver, 12).until(
-                EC.presence_of_element_located((By.TAG_NAME, "h1"))
-            )
-            time.sleep(random.uniform(1, 2))
-        except (TimeoutException, WebDriverException) as exc:
-            log.warning("Skipping %s — failed to load: %s", job_url, exc)
+        if not self._load(driver, job_url, By.TAG_NAME, "h1", timeout=12):
+            log.warning("Skipping %s — failed to load", job_url)
             return None
+        time.sleep(random.uniform(1, 2))
 
         try:
             name = driver.find_element(By.TAG_NAME, "h1").text.strip()
@@ -230,14 +173,25 @@ class Fw3Scraper:
             log.warning("Skipping %s — no <h1> found", job_url)
             return None
 
-        company_name = self._wait_and_get_text(driver, "h2.JobPage_companyName__G6Nta")
-        location = self._wait_and_get_text(driver, "div.JobPage_companyLocation__jz0CV")
+        posting = self._json_ld(driver)
+        company_name = (
+            self._wait_and_get_text(driver, "[class*='companyName']")
+            or self._first_text(driver, ["//h1/following::h2[1]"], by=By.XPATH)
+            or self._clean((posting.get("hiringOrganization") or {}).get("name") if posting else None)
+        )
+        location = (
+            self._wait_and_get_text(driver, "[class*='companyLocation']")
+            or (self._ld_location(posting) if posting else None)
+        )
         compensation = self._find_compensation(driver)
-
         description_html = self._find_html_field(driver, [
             "//*[contains(translate(@class,'DESCRIPTION','description'),'description')]",
             "//*[contains(translate(@data-testid,'DESCRIPTION','description'),'description')]",
-        ])
+        ]) or (f"<p>{posting['description']}</p>" if posting and posting.get("description") else None)
+
+        for field, value in (("company", company_name), ("location", location)):
+            if value is None:
+                log.warning("%s: %s not found (selectors may have drifted)", job_url, field)
 
         return {
             "name": name,
@@ -248,18 +202,7 @@ class Fw3Scraper:
             "description_html": description_html,
         }
 
-    @staticmethod
-    def match_keywords(text: str, keywords: list) -> list:
-        """Return the subset of keywords (original casing) present in text (case-insensitive)."""
-        lowered = text.lower()
-        return [kw for kw in keywords if kw.lower() in lowered]
-
     # ── Private helpers ────────────────────────────────────────────────────────
-
-    def _report(self, stage: str, current: int, total: int) -> None:
-        """Invoke the optional progress callback, if one was provided."""
-        if self.on_progress:
-            self.on_progress(stage, current, total)
 
     def _build_driver(self) -> webdriver.Chrome:
         opts = Options()
@@ -267,14 +210,70 @@ class Fw3Scraper:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--window-size=1280,900")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_argument(
-            "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        service = Service(ChromeDriverManager().install())
+        # No anti-detection options on purpose. chromedriver: use one already on PATH;
+        # otherwise Selenium Manager resolves it (it downloads only when none is found).
+        driver_path = shutil.which("chromedriver")
+        service = Service(driver_path) if driver_path else Service()
         return webdriver.Chrome(service=service, options=opts)
+
+    def _load(self, driver, url: str, by: str, value: str, timeout: int) -> bool:
+        """
+        Navigate and wait for an element, retrying with backoff on timeouts, driver errors
+        and rate-limit pages (HTTP 429 / "Too Many Requests"). False after _RETRIES tries.
+        """
+        for attempt in range(_RETRIES):
+            try:
+                driver.get(url)
+                WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+                title = (getattr(driver, "title", "") or "").lower()
+                if "too many requests" in title or title.startswith("429"):
+                    raise WebDriverException("rate limited (429)")
+                return True
+            except (TimeoutException, WebDriverException) as exc:
+                log.warning("Load of %s failed (attempt %d/%d): %s", url, attempt + 1, _RETRIES, exc)
+                if attempt < _RETRIES - 1:
+                    time.sleep(2 ** attempt * 5 + random.uniform(0, 1))
+        return False
+
+    @staticmethod
+    def _clean(text) -> str | None:
+        return (str(text).strip() or None) if text else None
+
+    @staticmethod
+    def _json_ld(driver) -> dict | None:
+        """The page's schema.org JobPosting JSON-LD block, if any (fallback data source)."""
+        for el in driver.find_elements(By.CSS_SELECTOR, 'script[type="application/ld+json"]'):
+            try:
+                data = json.loads(el.get_attribute("innerHTML") or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for item in (data if isinstance(data, list) else [data]):
+                if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                    return item
+        return None
+
+    @staticmethod
+    def _ld_location(posting: dict) -> str | None:
+        loc = posting.get("jobLocation")
+        loc = loc[0] if isinstance(loc, list) and loc else loc
+        addr = (loc or {}).get("address") if isinstance(loc, dict) else None
+        if isinstance(addr, dict):
+            parts = [addr.get(k) for k in ("addressLocality", "addressRegion", "addressCountry")]
+            text = ", ".join(str(p) for p in parts if p and not isinstance(p, dict))
+            if text:
+                return text
+        return "Remote" if posting.get("jobLocationType") == "TELECOMMUTE" else None
+
+    def _first_text(self, driver, selectors: list, by: str = By.CSS_SELECTOR) -> str | None:
+        """First non-empty text among selectors, without waiting (page already loaded)."""
+        for selector in selectors:
+            try:
+                text = driver.find_element(by, selector).text.strip()
+            except NoSuchElementException:
+                continue
+            if text:
+                return text
+        return None
 
     def _wait_and_get_text(self, driver: webdriver.Chrome, css_selector: str, timeout: int = 5) -> str | None:
         """Wait for a CSS selector to render, then return its stripped text, or None."""
@@ -289,10 +288,10 @@ class Fw3Scraper:
 
     def _find_compensation(self, driver: webdriver.Chrome) -> str | None:
         """
-        Return the first compensation match found across all div.JobPage_keyDetail__Dddhf
-        elements, or None if none contain a recognizable compensation value/range.
+        Return the first compensation match found across all key-detail elements
+        (class contains "keyDetail", independent of the hashed CSS-module suffix), or None if none contain a recognizable compensation value/range.
         """
-        for el in driver.find_elements(By.CSS_SELECTOR, "div.JobPage_keyDetail__Dddhf"):
+        for el in driver.find_elements(By.CSS_SELECTOR, "[class*='keyDetail']"):
             match = COMPENSATION_PATTERN.search(el.text)
             if match:
                 return match.group(0)
