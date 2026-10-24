@@ -5,11 +5,33 @@ on:
     branches:
       - main
 
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: self-hosted
+    timeout-minutes: 15
 
     steps:
       - name: Deploy Job Scraper
         run: |
           ~/scripts/deploy-job-scraper-prod.sh
+
+      - name: Verify deployed commit
+        run: |
+          HEAD_SHA=$(git -C ~/production/job_scraper rev-parse HEAD)
+          echo "deployed=$HEAD_SHA expected=$GITHUB_SHA"
+          [ "$HEAD_SHA" = "$GITHUB_SHA" ]
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:8420/sources -o /tmp/sources.json; then
+              python3 -c 'import json; d=json.load(open("/tmp/sources.json")); d=d.get("sources", d) if isinstance(d, dict) else d; assert d, "empty source list"; print("sources:", len(d))' && exit 0
+            fi
+            sleep 2
+          done
+          echo "health check failed" >&2
+          exit 1
