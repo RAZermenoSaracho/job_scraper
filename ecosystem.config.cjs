@@ -3,7 +3,7 @@ const fs = require("fs");
 // Path to the web3.career API token file (the value is never committed). Read at pm2
 // startup; if the file is missing/unreadable the variable stays unset and the web3career
 // API adapter reports itself non-executable in GET /sources.
-const WEB3CAREER_TOKEN_FILE = "/Users/razs/production/odoo_src/web3career_api_token";
+const WEB3CAREER_TOKEN_FILE = "/Users/razs/secrets/web3career/api_token";
 
 function readToken(path) {
   try {
